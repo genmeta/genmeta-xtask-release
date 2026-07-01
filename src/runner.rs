@@ -637,11 +637,9 @@ fn deb_metadata(path: &Path) -> Result<PackageFileMetadata, RunCurrentDirError> 
 }
 
 fn rpm_metadata(path: &Path) -> Result<PackageFileMetadata, RunCurrentDirError> {
-    let output = Command::new("rpm")
-        .arg("-qp")
-        .arg("--queryformat")
-        .arg("%{NAME}\n%{VERSION}-%{RELEASE}\n%{ARCH}\n")
-        .arg(path)
+    let command = rpm_metadata_command(path, host_rpm_available())?;
+    let output = Command::new(&command.program)
+        .args(&command.args)
         .output()
         .context(run_current_dir_error::RpmMetadataCommandSnafu {
             path: path.to_path_buf(),
@@ -661,6 +659,65 @@ fn rpm_metadata(path: &Path) -> Result<PackageFileMetadata, RunCurrentDirError> 
         package_version: lines.next().map(ToOwned::to_owned),
         architecture: lines.next().map(ToOwned::to_owned),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RpmMetadataCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+fn rpm_metadata_command(
+    path: &Path,
+    host_rpm_available: bool,
+) -> Result<RpmMetadataCommand, RunCurrentDirError> {
+    let query_args = [
+        "-qp".to_string(),
+        "--queryformat".to_string(),
+        "%{NAME}\n%{VERSION}-%{RELEASE}\n%{ARCH}\n".to_string(),
+    ];
+    if host_rpm_available {
+        let mut args = query_args.to_vec();
+        args.push(path.to_string_lossy().into_owned());
+        return Ok(RpmMetadataCommand {
+            program: "rpm".to_string(),
+            args,
+        });
+    }
+
+    let parent = path
+        .parent()
+        .context(run_current_dir_error::RpmMetadataParentSnafu {
+            path: path.to_path_buf(),
+        })?;
+    let file_name = path.file_name().and_then(|name| name.to_str()).context(
+        run_current_dir_error::RpmMetadataFileNameSnafu {
+            path: path.to_path_buf(),
+        },
+    )?;
+    let mut args = vec![
+        "run".to_string(),
+        "--rm".to_string(),
+        "--volume".to_string(),
+        format!("{}:/rpm:ro", parent.to_string_lossy()),
+        "fedora:40".to_string(),
+        "rpm".to_string(),
+    ];
+    args.extend(query_args);
+    args.push(format!("/rpm/{file_name}"));
+    Ok(RpmMetadataCommand {
+        program: "docker".to_string(),
+        args,
+    })
+}
+
+fn host_rpm_available() -> bool {
+    Command::new("rpm")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn stanza_field(stanza: &str, field: &str) -> Option<String> {
@@ -762,6 +819,39 @@ fn short_hash(input: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::rpm_metadata_command;
+
+    #[test]
+    fn rpm_metadata_command_uses_host_rpm_when_available() {
+        let command = rpm_metadata_command(Path::new("/tmp/sample.rpm"), true)
+            .expect("host rpm command should resolve");
+
+        assert_eq!(command.program, "rpm");
+        assert_eq!(
+            command.args.last().map(String::as_str),
+            Some("/tmp/sample.rpm")
+        );
+    }
+
+    #[test]
+    fn rpm_metadata_command_uses_fedora_container_without_host_rpm() {
+        let command = rpm_metadata_command(Path::new("/tmp/out/sample.rpm"), false)
+            .expect("container rpm command should resolve");
+
+        assert_eq!(command.program, "docker");
+        assert_eq!(command.args[0], "run");
+        assert!(command.args.iter().any(|arg| arg == "/tmp/out:/rpm:ro"));
+        assert_eq!(
+            command.args.last().map(String::as_str),
+            Some("/rpm/sample.rpm")
+        );
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -909,6 +999,10 @@ pub enum RunCurrentDirError {
         source: std::io::Error,
         path: PathBuf,
     },
+    #[snafu(display("rpm package artifact path has no parent directory"))]
+    RpmMetadataParent { path: PathBuf },
+    #[snafu(display("rpm package artifact file name is not valid utf-8"))]
+    RpmMetadataFileName { path: PathBuf },
     #[snafu(display("rpm metadata command failed for {path:?}"))]
     RpmMetadataStatus { path: PathBuf },
     #[snafu(display("rpm metadata output was not utf-8"))]
