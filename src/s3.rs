@@ -3,24 +3,15 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     str::FromStr,
 };
 
-use aws_credential_types::Credentials;
-use aws_sdk_s3::{
-    Client,
-    config::{Region, RequestChecksumCalculation},
-    error::SdkError,
-    operation::{
-        get_object::GetObjectError, head_object::HeadObjectError,
-        list_objects_v2::ListObjectsV2Error, put_object::PutObjectError,
-    },
-    primitives::{ByteStream, ByteStreamError},
-};
 use sha2::Digest;
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use tempfile::TempDir;
+use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
+use url::Url;
 use walkdir::WalkDir;
 
 use crate::{
@@ -55,12 +46,16 @@ use crate::{
 
 const APT_ARCHES: &[&str] = &["amd64", "arm64", "armhf", "i386"];
 const APT_COMPONENTS: &[&str] = &["main", "contrib", "non-free"];
+const AWS_REGION: &str = "auto";
+const AWS_SERVICE: &str = "s3";
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const AMZ_DATE_FORMAT: &[FormatItem<'_>] =
+    format_description!("[year][month][day]T[hour][minute][second]Z");
+const DATE_SCOPE_FORMAT: &[FormatItem<'_>] = format_description!("[year][month][day]");
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum S3PublishError {
-    #[snafu(display("failed to create tokio runtime"))]
-    CreateRuntime { source: std::io::Error },
     #[snafu(display("failed to load publish manifests"))]
     LoadManifests {
         source: LoadS3PublishCommandManifestsError,
@@ -166,24 +161,34 @@ pub enum S3PublishError {
     ImmutableCollision { source: ImmutableCollisionError },
     #[snafu(display("metadata upload is missing remote baseline"))]
     MissingMetadataUploadBaseline,
-    #[snafu(display("failed to read upload body"))]
-    ReadUploadBody { source: ByteStreamError },
+    #[snafu(display("failed to parse s3 endpoint url"))]
+    ParseEndpointUrl { source: url::ParseError },
+    #[snafu(display("s3 endpoint url is missing host"))]
+    MissingEndpointHost,
+    #[snafu(display("failed to format s3 signing timestamp"))]
+    FormatSigningTime { source: time::error::Format },
+    #[snafu(display("failed to run curl"))]
+    RunCurl { source: std::io::Error },
+    #[snafu(display("curl exited without http status"))]
+    MissingCurlStatus,
+    #[snafu(display("curl returned invalid http status"))]
+    InvalidCurlStatus { status: String },
+    #[snafu(display("failed to read curl response body"))]
+    ReadCurlResponseBody {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("failed to read curl response headers"))]
+    ReadCurlResponseHeaders {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[snafu(display("remote object changed during conditional upload"))]
     ConditionalUploadChanged { key: String },
     #[snafu(display("failed to upload remote object"))]
-    UploadObject {
-        key: String,
-        #[snafu(source(from(SdkError<PutObjectError>, Box::new)))]
-        source: Box<SdkError<PutObjectError>>,
-    },
+    UploadObject { key: String, status: u16 },
     #[snafu(display("failed to fetch remote object"))]
-    FetchObject {
-        key: String,
-        #[snafu(source(from(SdkError<GetObjectError>, Box::new)))]
-        source: Box<SdkError<GetObjectError>>,
-    },
-    #[snafu(display("failed to read remote object"))]
-    ReadRemoteObject { source: ByteStreamError },
+    FetchObject { key: String, status: u16 },
     #[snafu(display("remote object is missing"))]
     MissingRemoteObject { key: String },
     #[snafu(display("failed to create download directory"))]
@@ -197,16 +202,9 @@ pub enum S3PublishError {
         source: std::io::Error,
     },
     #[snafu(display("failed to list s3 prefix"))]
-    ListObjects {
-        #[snafu(source(from(SdkError<ListObjectsV2Error>, Box::new)))]
-        source: Box<SdkError<ListObjectsV2Error>>,
-    },
+    ListObjects { prefix: String, status: u16 },
     #[snafu(display("failed to inspect remote object"))]
-    InspectObject {
-        key: String,
-        #[snafu(source(from(SdkError<HeadObjectError>, Box::new)))]
-        source: Box<SdkError<HeadObjectError>>,
-    },
+    InspectObject { key: String, status: u16 },
     #[snafu(display("remote object is missing ETag"))]
     MissingRemoteEtag { key: String },
     #[snafu(display("failed to read file for sha256"))]
@@ -243,17 +241,40 @@ struct PlannedUpload {
     condition: Option<UploadCondition>,
 }
 
+#[derive(Debug, Clone)]
+struct S3Client {
+    endpoint: Url,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct S3Response {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+struct S3Request<'a> {
+    method: &'a str,
+    bucket: &'a str,
+    key: &'a str,
+    query: &'a [(String, String)],
+    headers: BTreeMap<String, String>,
+    body_path: Option<&'a Path>,
+    payload_sha256: &'a str,
+}
+
 pub fn run(
     root: &Path,
     target_dir: &Path,
     contract: &ReleaseContract,
     command: &S3PublishCommandRequest,
 ) -> Result<(), S3PublishError> {
-    let runtime = tokio::runtime::Runtime::new().context(s3_publish_error::CreateRuntimeSnafu)?;
-    runtime.block_on(run_async(root, target_dir, contract, command))
+    run_inner(root, target_dir, contract, command)
 }
 
-async fn run_async(
+fn run_inner(
     root: &Path,
     target_dir: &Path,
     contract: &ReleaseContract,
@@ -268,56 +289,44 @@ async fn run_async(
     for manifest in manifests {
         let target = resolve_s3_publish_target(contract, manifest.kind, &values)
             .context(s3_publish_error::ResolveTargetSnafu)?;
-        let client = s3_client(target.common()).await?;
+        let client = s3_client(target.common())?;
         match target {
             S3PublishTarget::Brew(target) => {
                 publish_brew(
                     root, target_dir, contract, &options, &client, target, manifest,
-                )
-                .await?;
+                )?;
             }
             S3PublishTarget::Scoop(target) => {
                 publish_scoop(
                     root, target_dir, contract, &options, &client, target, manifest,
-                )
-                .await?;
+                )?;
             }
             S3PublishTarget::Deb(target) => {
-                publish_deb(target_dir, &options, &client, target, manifest).await?;
+                publish_deb(target_dir, &options, &client, target, manifest)?;
             }
             S3PublishTarget::Rpm(target) => {
-                publish_rpm(target_dir, &options, &client, target, manifest).await?;
+                publish_rpm(target_dir, &options, &client, target, manifest)?;
             }
         }
     }
     Ok(())
 }
 
-async fn s3_client(common: &S3CommonPublishTarget) -> Result<Client, S3PublishError> {
-    let credentials = Credentials::new(
-        common.access_key_id.trim().to_string(),
-        common.secret_access_key.trim().to_string(),
-        None,
-        None,
-        "genmeta-xtask-release",
-    );
-    let s3_config = aws_sdk_s3::config::Builder::new()
-        .behavior_version_latest()
-        .region(Region::new("auto"))
-        .endpoint_url(common.endpoint_url.clone())
-        .credentials_provider(credentials)
-        .force_path_style(true)
-        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .build();
-    Ok(Client::from_conf(s3_config))
+fn s3_client(common: &S3CommonPublishTarget) -> Result<S3Client, S3PublishError> {
+    Ok(S3Client {
+        endpoint: Url::parse(&common.endpoint_url)
+            .context(s3_publish_error::ParseEndpointUrlSnafu)?,
+        access_key_id: common.access_key_id.trim().to_string(),
+        secret_access_key: common.secret_access_key.trim().to_string(),
+    })
 }
 
-async fn publish_brew(
+fn publish_brew(
     root: &Path,
     target_dir: &Path,
     contract: &ReleaseContract,
     options: &S3Options,
-    client: &Client,
+    client: &S3Client,
     target: S3BrewPublishTarget,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
@@ -327,8 +336,7 @@ async fn publish_brew(
         target.common.bucket.as_str(),
         &target.prefix,
         manifest,
-    )
-    .await?;
+    )?;
     let package_id = PackageId::new(manifest.package.clone())
         .context(s3_publish_error::InvalidPackageIdSnafu)?;
     let metadata = resolve_metadata(contract, package_id.as_str(), root)
@@ -365,15 +373,15 @@ async fn publish_brew(
         entry: true,
         condition: None,
     });
-    publish_uploads(options, client, target.common.bucket.as_str(), uploads).await
+    publish_uploads(options, client, target.common.bucket.as_str(), uploads)
 }
 
-async fn publish_scoop(
+fn publish_scoop(
     root: &Path,
     target_dir: &Path,
     contract: &ReleaseContract,
     options: &S3Options,
-    client: &Client,
+    client: &S3Client,
     target: S3ScoopPublishTarget,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
@@ -383,8 +391,7 @@ async fn publish_scoop(
         target.common.bucket.as_str(),
         &target.prefix,
         manifest,
-    )
-    .await?;
+    )?;
     let package_id = PackageId::new(manifest.package.clone())
         .context(s3_publish_error::InvalidPackageIdSnafu)?;
     let metadata = resolve_metadata(contract, package_id.as_str(), root)
@@ -426,12 +433,12 @@ async fn publish_scoop(
         entry: true,
         condition: None,
     });
-    publish_uploads(options, client, target.common.bucket.as_str(), uploads).await
+    publish_uploads(options, client, target.common.bucket.as_str(), uploads)
 }
 
-async fn plan_versioned_archive_uploads(
+fn plan_versioned_archive_uploads(
     target_dir: &Path,
-    client: &Client,
+    client: &S3Client,
     bucket: &str,
     prefix: &crate::publish::RemotePrefix,
     mut manifest: PackageManifest,
@@ -451,7 +458,7 @@ async fn plan_versioned_archive_uploads(
             }
         );
         let key = prefix.join(&archive_name);
-        let remote = remote_artifact_state(client, bucket, &key).await?;
+        let remote = remote_artifact_state(client, bucket, &key)?;
         let plan = plan_versioned_immutable_payload(&key, &actual_sha256, remote);
         artifact.sha256 = plan.metadata_sha256().to_string();
         if let Some(condition) = plan.upload_condition() {
@@ -501,15 +508,14 @@ fn manifest_template(
     fs::read_to_string(&path).context(s3_publish_error::ReadManifestTemplateSnafu { path })
 }
 
-async fn publish_deb(
+fn publish_deb(
     target_dir: &Path,
     options: &S3Options,
-    client: &Client,
+    client: &S3Client,
     target: S3DebPublishTarget,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
-    let remote_packages =
-        remote_deb_packages(client, target.common.bucket.as_str(), &target).await?;
+    let remote_packages = remote_deb_packages(client, target.common.bucket.as_str(), &target)?;
     let local_payloads = publishable_deb_payloads_from_manifest_and_packages(
         &manifest,
         remote_packages.iter().map(String::as_str),
@@ -526,8 +532,7 @@ async fn publish_deb(
         .collect::<Vec<_>>();
     let retained = retained_remote_deb_package_entries(&manifest, remote_entries)
         .context(s3_publish_error::SelectRetainedDebEntriesSnafu)?;
-    let conditions =
-        remote_deb_entry_conditions(client, target.common.bucket.as_str(), &target).await?;
+    let conditions = remote_deb_entry_conditions(client, target.common.bucket.as_str(), &target)?;
     let repository = build_deb_repository(
         target_dir,
         client,
@@ -535,11 +540,10 @@ async fn publish_deb(
         &target,
         local_payloads,
         retained,
-    )
-    .await?;
+    )?;
     generate_deb_metadata(repository.path(), &target)?;
     let mut uploads = repository_uploads(repository.path(), &target.prefix, PackageSystem::Deb)?;
-    uploads = plan_repository_uploads(client, target.common.bucket.as_str(), uploads).await?;
+    uploads = plan_repository_uploads(client, target.common.bucket.as_str(), uploads)?;
     apply_entry_conditions(&mut uploads, &conditions)?;
     uploads.sort_by(|left, right| {
         linux_repository_upload_order(PackageSystem::Deb, &left.key)
@@ -547,11 +551,11 @@ async fn publish_deb(
             .cmp(&linux_repository_upload_order(PackageSystem::Deb, &right.key).unwrap_or(2))
             .then_with(|| left.key.cmp(&right.key))
     });
-    publish_uploads(options, client, target.common.bucket.as_str(), uploads).await
+    publish_uploads(options, client, target.common.bucket.as_str(), uploads)
 }
 
-async fn remote_deb_packages(
-    client: &Client,
+fn remote_deb_packages(
+    client: &S3Client,
     bucket: &str,
     target: &S3DebPublishTarget,
 ) -> Result<Vec<String>, S3PublishError> {
@@ -562,7 +566,7 @@ async fn remote_deb_packages(
                 "dists/{}/{component}/binary-{arch}/Packages",
                 target.suite
             ));
-            if let Some(bytes) = get_object_bytes(client, bucket, &key).await? {
+            if let Some(bytes) = get_object_bytes(client, bucket, &key)? {
                 packages.push(
                     String::from_utf8(bytes).context(s3_publish_error::RemotePackagesUtf8Snafu)?,
                 );
@@ -572,15 +576,15 @@ async fn remote_deb_packages(
     Ok(packages)
 }
 
-async fn remote_deb_entry_conditions(
-    client: &Client,
+fn remote_deb_entry_conditions(
+    client: &S3Client,
     bucket: &str,
     target: &S3DebPublishTarget,
 ) -> Result<BTreeMap<String, UploadCondition>, S3PublishError> {
     let mut conditions = BTreeMap::new();
     for relative in deb_entry_metadata_relative_paths(&target.suite) {
         let key = target.prefix.join(&relative);
-        let condition = remote_upload_condition(client, bucket, &key).await?;
+        let condition = remote_upload_condition(client, bucket, &key)?;
         conditions.insert(key, condition);
     }
     Ok(conditions)
@@ -603,9 +607,9 @@ fn deb_entry_metadata_relative_paths(suite: &str) -> Vec<String> {
     paths
 }
 
-async fn build_deb_repository(
+fn build_deb_repository(
     target_dir: &Path,
-    client: &Client,
+    client: &S3Client,
     bucket: &str,
     target: &S3DebPublishTarget,
     local_payloads: Vec<LinuxPackagePayload>,
@@ -624,7 +628,7 @@ async fn build_deb_repository(
     for remote in retained_remote {
         let destination = repository.path().join(&remote.filename);
         let key = target.prefix.join(&remote.filename);
-        download_object(client, bucket, &key, &destination).await?;
+        download_object(client, bucket, &key, &destination)?;
     }
     Ok(repository)
 }
@@ -738,10 +742,10 @@ fn deb_metadata_script(suite: &str, fingerprint: &str, has_passphrase: bool) -> 
     script
 }
 
-async fn publish_rpm(
+fn publish_rpm(
     target_dir: &Path,
     options: &S3Options,
-    client: &Client,
+    client: &S3Client,
     target: S3RpmPublishTarget,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
@@ -749,8 +753,7 @@ async fn publish_rpm(
         client,
         target.common.bucket.as_str(),
         target.prefix.as_str(),
-    )
-    .await?;
+    )?;
     let remote_rpm_keys = remote_keys
         .iter()
         .filter(|key| key.ends_with(".rpm"))
@@ -777,18 +780,17 @@ async fn publish_rpm(
         &target,
         local_payloads,
         retained_remote_payloads,
-    )
-    .await?;
+    )?;
     generate_rpm_metadata(repository.path())?;
     let mut uploads = repository_uploads(repository.path(), &target.prefix, PackageSystem::Rpm)?;
-    uploads = plan_repository_uploads(client, target.common.bucket.as_str(), uploads).await?;
+    uploads = plan_repository_uploads(client, target.common.bucket.as_str(), uploads)?;
     uploads.sort_by(|left, right| {
         linux_repository_upload_order(PackageSystem::Rpm, &left.key)
             .unwrap_or(2)
             .cmp(&linux_repository_upload_order(PackageSystem::Rpm, &right.key).unwrap_or(2))
             .then_with(|| left.key.cmp(&right.key))
     });
-    publish_uploads(options, client, target.common.bucket.as_str(), uploads).await
+    publish_uploads(options, client, target.common.bucket.as_str(), uploads)
 }
 
 fn remote_rpm_payload_to_linux_payload(
@@ -818,9 +820,9 @@ fn remote_rpm_payload_to_linux_payload(
     })
 }
 
-async fn build_rpm_repository(
+fn build_rpm_repository(
     target_dir: &Path,
-    client: &Client,
+    client: &S3Client,
     bucket: &str,
     target: &S3RpmPublishTarget,
     local_payloads: Vec<LinuxPackagePayload>,
@@ -846,7 +848,7 @@ async fn build_rpm_repository(
             .join(&payload.archive_name);
         let key = linux_payload_key(&target.prefix, PackageSystem::Rpm, &payload)
             .context(s3_publish_error::ResolveRpmPayloadKeySnafu)?;
-        download_object(client, bucket, &key, &destination).await?;
+        download_object(client, bucket, &key, &destination)?;
     }
     Ok(repository)
 }
@@ -905,8 +907,8 @@ fn repository_uploads(
     Ok(uploads)
 }
 
-async fn plan_repository_uploads(
-    client: &Client,
+fn plan_repository_uploads(
+    client: &S3Client,
     bucket: &str,
     uploads: Vec<PlannedUpload>,
 ) -> Result<Vec<PlannedUpload>, S3PublishError> {
@@ -917,7 +919,7 @@ async fn plan_repository_uploads(
             continue;
         }
         let actual_sha256 = sha256_file(&upload.path)?;
-        let remote = remote_artifact_state(client, bucket, &upload.key).await?;
+        let remote = remote_artifact_state(client, bucket, &upload.key)?;
         if let Some(condition) = plan_immutable_upload(&upload.key, &actual_sha256, remote)
             .context(s3_publish_error::ImmutableCollisionSnafu)?
         {
@@ -948,9 +950,9 @@ fn apply_entry_conditions(
     Ok(())
 }
 
-async fn publish_uploads(
+fn publish_uploads(
     options: &S3Options,
-    client: &Client,
+    client: &S3Client,
     bucket: &str,
     mut uploads: Vec<PlannedUpload>,
 ) -> Result<(), S3PublishError> {
@@ -966,42 +968,52 @@ async fn publish_uploads(
         return Ok(());
     }
     for upload in uploads {
-        upload_file(client, bucket, &upload.path, &upload.key, upload.condition).await?;
+        upload_file(client, bucket, &upload.path, &upload.key, upload.condition)?;
     }
     Ok(())
 }
 
-async fn upload_file(
-    client: &Client,
+fn upload_file(
+    client: &S3Client,
     bucket: &str,
     path: &Path,
     key: &str,
     condition: Option<UploadCondition>,
 ) -> Result<(), S3PublishError> {
-    let body = ByteStream::from_path(path)
-        .await
-        .context(s3_publish_error::ReadUploadBodySnafu)?;
-    let mut request = client.put_object().bucket(bucket).key(key).body(body);
+    let payload_sha256 = sha256_file(path)?;
+    let mut headers = BTreeMap::new();
     match condition {
         Some(UploadCondition::IfMissing) => {
-            request = request.if_none_match("*");
+            headers.insert("if-none-match".to_string(), "*".to_string());
         }
         Some(UploadCondition::IfMatch(etag)) => {
-            request = request.if_match(etag);
+            headers.insert("if-match".to_string(), etag);
         }
         None => {}
     }
-    match request.send().await {
-        Ok(_) => {}
-        Err(error) if is_precondition_failed_error(&error) => {
+    let response = signed_s3_request(
+        client,
+        S3Request {
+            method: "PUT",
+            bucket,
+            key,
+            query: &[],
+            headers,
+            body_path: Some(path),
+            payload_sha256: &payload_sha256,
+        },
+    )?;
+    match response.status {
+        200..=299 => {}
+        409 | 412 => {
             return Err(S3PublishError::ConditionalUploadChanged {
                 key: key.to_string(),
             });
         }
-        Err(error) => {
+        status => {
             return Err(S3PublishError::UploadObject {
                 key: key.to_string(),
-                source: Box::new(error),
+                status,
             });
         }
     }
@@ -1009,40 +1021,40 @@ async fn upload_file(
     Ok(())
 }
 
-async fn get_object_bytes(
-    client: &Client,
+fn get_object_bytes(
+    client: &S3Client,
     bucket: &str,
     key: &str,
 ) -> Result<Option<Vec<u8>>, S3PublishError> {
-    let output = match client.get_object().bucket(bucket).key(key).send().await {
-        Ok(output) => output,
-        Err(error) if is_missing_object_error(&error) => return Ok(None),
-        Err(error) => {
-            return Err(S3PublishError::FetchObject {
-                key: key.to_string(),
-                source: Box::new(error),
-            });
-        }
-    };
-    let mut bytes = Vec::new();
-    let mut body = output.body;
-    while let Some(chunk) = body
-        .try_next()
-        .await
-        .context(s3_publish_error::ReadRemoteObjectSnafu)?
-    {
-        bytes.extend_from_slice(&chunk);
+    let response = signed_s3_request(
+        client,
+        S3Request {
+            method: "GET",
+            bucket,
+            key,
+            query: &[],
+            headers: BTreeMap::new(),
+            body_path: None,
+            payload_sha256: EMPTY_SHA256,
+        },
+    )?;
+    match response.status {
+        200..=299 => Ok(Some(response.body)),
+        404 => Ok(None),
+        status => Err(S3PublishError::FetchObject {
+            key: key.to_string(),
+            status,
+        }),
     }
-    Ok(Some(bytes))
 }
 
-async fn download_object(
-    client: &Client,
+fn download_object(
+    client: &S3Client,
     bucket: &str,
     key: &str,
     path: &Path,
 ) -> Result<(), S3PublishError> {
-    let bytes = get_object_bytes(client, bucket, key).await?.context(
+    let bytes = get_object_bytes(client, bucket, key)?.context(
         s3_publish_error::MissingRemoteObjectSnafu {
             key: key.to_string(),
         },
@@ -1057,132 +1069,338 @@ async fn download_object(
     })
 }
 
-async fn list_object_keys(
-    client: &Client,
+fn list_object_keys(
+    client: &S3Client,
     bucket: &str,
     prefix: &str,
 ) -> Result<Vec<String>, S3PublishError> {
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .into_paginator()
-        .send();
     let mut keys = Vec::new();
-    while let Some(page) = paginator.next().await {
-        let page = page.context(s3_publish_error::ListObjectsSnafu)?;
-        for object in page.contents() {
-            if let Some(key) = object.key() {
-                keys.push(key.to_string());
-            }
+    let mut continuation = None::<String>;
+    loop {
+        let mut query = vec![("list-type".to_string(), "2".to_string())];
+        if !prefix.is_empty() {
+            query.push(("prefix".to_string(), prefix.to_string()));
+        }
+        if let Some(token) = &continuation {
+            query.push(("continuation-token".to_string(), token.clone()));
+        }
+        let response = signed_s3_request(
+            client,
+            S3Request {
+                method: "GET",
+                bucket,
+                key: "",
+                query: &query,
+                headers: BTreeMap::new(),
+                body_path: None,
+                payload_sha256: EMPTY_SHA256,
+            },
+        )?;
+        if !(200..=299).contains(&response.status) {
+            return Err(S3PublishError::ListObjects {
+                prefix: prefix.to_string(),
+                status: response.status,
+            });
+        }
+        let xml =
+            String::from_utf8(response.body).context(s3_publish_error::RemotePackagesUtf8Snafu)?;
+        keys.extend(xml_tag_values(&xml, "Key"));
+        continuation = xml_tag_values(&xml, "NextContinuationToken")
+            .into_iter()
+            .next();
+        if continuation.is_none() {
+            break;
         }
     }
     Ok(keys)
 }
 
-async fn remote_artifact_state(
-    client: &Client,
+fn remote_artifact_state(
+    client: &S3Client,
     bucket: &str,
     key: &str,
 ) -> Result<RemotePayloadState, S3PublishError> {
-    let output = match client.get_object().bucket(bucket).key(key).send().await {
-        Ok(output) => output,
-        Err(error) if is_missing_object_error(&error) => return Ok(RemotePayloadState::Missing),
-        Err(error) => {
-            return Err(S3PublishError::FetchObject {
-                key: key.to_string(),
-                source: Box::new(error),
-            });
-        }
+    let Some(bytes) = get_object_bytes(client, bucket, key)? else {
+        return Ok(RemotePayloadState::Missing);
     };
     Ok(RemotePayloadState::Present {
-        sha256: sha256_stream(output.body).await?,
+        sha256: sha256_bytes(&bytes),
     })
 }
 
-async fn remote_upload_condition(
-    client: &Client,
+fn remote_upload_condition(
+    client: &S3Client,
     bucket: &str,
     key: &str,
 ) -> Result<UploadCondition, S3PublishError> {
-    let output = match client.head_object().bucket(bucket).key(key).send().await {
-        Ok(output) => output,
-        Err(error) if is_missing_head_object_error(&error) => {
-            return Ok(UploadCondition::IfMissing);
+    let response = signed_s3_request(
+        client,
+        S3Request {
+            method: "HEAD",
+            bucket,
+            key,
+            query: &[],
+            headers: BTreeMap::new(),
+            body_path: None,
+            payload_sha256: EMPTY_SHA256,
+        },
+    )?;
+    match response.status {
+        200..=299 => {
+            let etag =
+                response
+                    .headers
+                    .get("etag")
+                    .context(s3_publish_error::MissingRemoteEtagSnafu {
+                        key: key.to_string(),
+                    })?;
+            Ok(UploadCondition::IfMatch(etag.to_string()))
         }
-        Err(error) => {
-            return Err(S3PublishError::InspectObject {
-                key: key.to_string(),
-                source: Box::new(error),
-            });
-        }
-    };
-    let etag = output
-        .e_tag()
-        .context(s3_publish_error::MissingRemoteEtagSnafu {
+        404 => Ok(UploadCondition::IfMissing),
+        status => Err(S3PublishError::InspectObject {
             key: key.to_string(),
+            status,
+        }),
+    }
+}
+
+fn signed_s3_request(
+    client: &S3Client,
+    request: S3Request<'_>,
+) -> Result<S3Response, S3PublishError> {
+    let now = OffsetDateTime::now_utc();
+    let amz_date = now
+        .format(AMZ_DATE_FORMAT)
+        .context(s3_publish_error::FormatSigningTimeSnafu)?;
+    let date_scope = now
+        .format(DATE_SCOPE_FORMAT)
+        .context(s3_publish_error::FormatSigningTimeSnafu)?;
+    let host = client
+        .endpoint
+        .host_str()
+        .context(s3_publish_error::MissingEndpointHostSnafu)?;
+    let host = match client.endpoint.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let mut headers = request.headers;
+    headers.insert("host".to_string(), host);
+    headers.insert(
+        "x-amz-content-sha256".to_string(),
+        request.payload_sha256.to_string(),
+    );
+    headers.insert("x-amz-date".to_string(), amz_date.clone());
+
+    let canonical_uri = canonical_uri(request.bucket, request.key);
+    let canonical_query = canonical_query(request.query);
+    let canonical_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{}:{}\n", name.to_ascii_lowercase(), value.trim()))
+        .collect::<String>();
+    let signed_headers = headers
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_request = format!(
+        "{}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{}",
+        request.method, request.payload_sha256
+    );
+    let scope = format!("{date_scope}/{AWS_REGION}/{AWS_SERVICE}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signature = aws_signature(&client.secret_access_key, &date_scope, &string_to_sign);
+    headers.insert(
+        "authorization".to_string(),
+        format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            client.access_key_id
+        ),
+    );
+
+    let url = request_url(&client.endpoint, &canonical_uri, &canonical_query);
+    run_curl(request.method, &url, &headers, request.body_path)
+}
+
+fn run_curl(
+    method: &str,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    body_path: Option<&Path>,
+) -> Result<S3Response, S3PublishError> {
+    let body = tempfile::NamedTempFile::new().context(s3_publish_error::CreateRepositorySnafu)?;
+    let header = tempfile::NamedTempFile::new().context(s3_publish_error::CreateRepositorySnafu)?;
+    let mut command = Command::new("curl");
+    command
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--location")
+        .arg("--request")
+        .arg(method)
+        .arg("--dump-header")
+        .arg(header.path())
+        .arg("--output")
+        .arg(body.path())
+        .arg("--write-out")
+        .arg("%{http_code}");
+    for (name, value) in headers {
+        command.arg("--header").arg(format!("{name}: {value}"));
+    }
+    if let Some(body_path) = body_path {
+        command.arg("--upload-file").arg(body_path);
+    }
+    command
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let output = command.output().context(s3_publish_error::RunCurlSnafu)?;
+    let status_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if status_text.is_empty() {
+        return Err(S3PublishError::MissingCurlStatus);
+    }
+    let status = status_text
+        .parse::<u16>()
+        .map_err(|_| S3PublishError::InvalidCurlStatus {
+            status: status_text.clone(),
         })?;
-    Ok(UploadCondition::IfMatch(etag.to_string()))
+    let body_bytes =
+        fs::read(body.path()).context(s3_publish_error::ReadCurlResponseBodySnafu {
+            path: body.path().to_path_buf(),
+        })?;
+    let headers = response_headers(header.path())?;
+    Ok(S3Response {
+        status,
+        headers,
+        body: body_bytes,
+    })
 }
 
-fn is_missing_object_error(error: &SdkError<GetObjectError, impl std::fmt::Debug>) -> bool {
-    if let Some(service) = error.as_service_error() {
-        let metadata = service.meta();
-        return classify_missing_object(metadata.code(), metadata.message(), None);
+fn response_headers(path: &Path) -> Result<BTreeMap<String, String>, S3PublishError> {
+    let text =
+        fs::read_to_string(path).context(s3_publish_error::ReadCurlResponseHeadersSnafu {
+            path: path.to_path_buf(),
+        })?;
+    let mut headers = BTreeMap::new();
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
-    false
+    Ok(headers)
 }
 
-fn is_missing_head_object_error(error: &SdkError<HeadObjectError, impl std::fmt::Debug>) -> bool {
-    if let Some(service) = error.as_service_error() {
-        let metadata = service.meta();
-        return classify_missing_object(metadata.code(), metadata.message(), None);
+fn request_url(endpoint: &Url, canonical_uri: &str, canonical_query: &str) -> String {
+    let mut url = endpoint.as_str().trim_end_matches('/').to_string();
+    url.push_str(canonical_uri);
+    if !canonical_query.is_empty() {
+        url.push('?');
+        url.push_str(canonical_query);
     }
-    false
+    url
 }
 
-fn is_precondition_failed_error(error: &SdkError<PutObjectError, impl std::fmt::Debug>) -> bool {
-    if let Some(service) = error.as_service_error() {
-        let metadata = service.meta();
-        return matches!(
-            metadata.code(),
-            Some("PreconditionFailed") | Some("ConditionalRequestConflict")
+fn canonical_uri(bucket: &str, key: &str) -> String {
+    let mut uri = String::from("/");
+    uri.push_str(&percent_encode_path_segment(bucket));
+    if !key.is_empty() {
+        uri.push('/');
+        uri.push_str(
+            &key.split('/')
+                .map(percent_encode_path_segment)
+                .collect::<Vec<_>>()
+                .join("/"),
         );
     }
-    false
+    uri
 }
 
-fn classify_missing_object(code: Option<&str>, message: Option<&str>, status: Option<u16>) -> bool {
-    if !matches!(status, None | Some(404)) {
-        return false;
-    }
-    match code {
-        Some("NoSuchKey") => true,
-        Some("NotFound") => message
-            .map(classify_not_found_message_as_object_missing)
-            .unwrap_or(false),
-        _ => false,
-    }
+fn canonical_query(query: &[(String, String)]) -> String {
+    let mut encoded = query
+        .iter()
+        .map(|(name, value)| (percent_encode_query(name), percent_encode_query(value)))
+        .collect::<Vec<_>>();
+    encoded.sort();
+    encoded
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
-fn classify_not_found_message_as_object_missing(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    if message.contains("bucket") {
-        return false;
-    }
-    message.contains("key") || message.contains("object") || message.contains("not found")
+fn percent_encode_path_segment(value: &str) -> String {
+    percent_encode(value, true)
 }
 
-async fn sha256_stream(mut body: ByteStream) -> Result<String, S3PublishError> {
-    let mut hasher = sha2::Sha256::new();
-    while let Some(bytes) = body
-        .try_next()
-        .await
-        .context(s3_publish_error::ReadRemoteObjectSnafu)?
-    {
-        hasher.update(&bytes);
+fn percent_encode_query(value: &str) -> String {
+    percent_encode(value, false)
+}
+
+fn percent_encode(value: &str, keep_slash: bool) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (keep_slash && byte == b'/');
+        if keep {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    encoded
+}
+
+fn aws_signature(secret: &str, date_scope: &str, string_to_sign: &str) -> String {
+    let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_scope.as_bytes());
+    let region_key = hmac_sha256(&date_key, AWS_REGION.as_bytes());
+    let service_key = hmac_sha256(&region_key, AWS_SERVICE.as_bytes());
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    hex_lower(&hmac_sha256(&signing_key, string_to_sign.as_bytes()))
+}
+
+fn hmac_sha256(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&key, value).as_ref().to_vec()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(&sha2::Sha256::digest(bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn xml_tag_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let value_start = start + open.len();
+        let Some(end) = rest[value_start..].find(&close) else {
+            break;
+        };
+        values.push(xml_unescape(&rest[value_start..value_start + end]));
+        rest = &rest[value_start + end + close.len()..];
+    }
+    values
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn compare_deb_versions(left: &str, right: &str) -> Result<Ordering, CompareDebVersionError> {

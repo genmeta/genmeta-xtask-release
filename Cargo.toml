@@ -8,10 +8,9 @@ repository = "https://github.com/genmeta/genmeta-xtask-release"
 publish = false
 
 [dependencies]
-aws-credential-types = "1"
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "sigv4a"] }
 cargo_metadata = "0.21"
 debversion = "0.5.2"
+ring = "0.17"
 rpm-version = "0.5.0"
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,8 +18,9 @@ serde_json = "1"
 sha2 = "0.10"
 snafu = "0.9"
 toml = "0.9"
-tokio = { version = "1", features = ["full"] }
+url = "2"
 tempfile = "3"
+time = { version = "0.3", features = ["formatting", "macros"] }
 walkdir = "2"
 
 [dev-dependencies]
