@@ -293,6 +293,11 @@ pub fn validate_package_command_manifest(
     validate_manifest_against_contract(manifest, contract)
         .context(validate_package_command_manifest_error::ContractSnafu)?;
     let mut requested_targets = Vec::new();
+    let artifact_packages = manifest
+        .artifacts
+        .iter()
+        .filter_map(|artifact| artifact.package_name.as_deref())
+        .collect::<BTreeSet<_>>();
     for build in &command.builds {
         if build.system != manifest.kind {
             continue;
@@ -309,7 +314,9 @@ pub fn validate_package_command_manifest(
             system: build.system,
         })?;
         for selected_build in selected {
-            if selected_build.package_id.as_str() == manifest.package {
+            if selected_build.package_id.as_str() == manifest.package
+                || artifact_packages.contains(selected_build.package_id.as_str())
+            {
                 requested_targets.push(selected_build.target);
             }
         }

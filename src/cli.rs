@@ -292,7 +292,17 @@ fn parse_sibling_source(
         return Ok(None);
     };
     let Some((name, path)) = value.split_once('=') else {
-        return Ok(None);
+        let path = PathBuf::from(value);
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ParsePackageSectionArgsError::InvalidSiblingSource {
+                value: value.to_string(),
+            })?;
+        return Ok(Some(SiblingSource {
+            name: name.to_string(),
+            host_path: path,
+        }));
     };
     if name.is_empty() || path.is_empty() {
         return Err(ParsePackageSectionArgsError::InvalidSiblingSource {

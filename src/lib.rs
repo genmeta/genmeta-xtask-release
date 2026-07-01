@@ -6,6 +6,7 @@ pub mod package;
 pub mod plan;
 pub mod publish;
 pub mod requires;
+pub mod runner;
 pub mod scoop;
 pub mod sibling;
 pub mod system;
