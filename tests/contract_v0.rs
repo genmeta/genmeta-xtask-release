@@ -1,115 +1,249 @@
+use std::path::Path;
+
 use sha2::Digest;
 
 use genmeta_xtask_release::{
-    contract::{ReleaseContract, load_release_contract},
+    contract::{ReleaseContract, ValidateContractError, load_release_contract},
     system::PackageSystem,
 };
+use snafu::{ResultExt, Snafu};
 
-const GATEWAY_CONTRACT: &str = r#"
-[package.pishoo]
-manifest = "pishoo/Cargo.toml"
+const GATEWAY_CONTRACT: &str = include_str!("fixtures/gateway.release.toml");
 
+fn load_fixture(name: &str) -> ReleaseContract {
+    let input =
+        std::fs::read_to_string(format!("tests/fixtures/{name}")).expect("fixture should read");
+    parse_contract(&input).expect("fixture contract should parse and validate")
+}
 
-[package.pishoo.build.env.DHTTP_ROOT_CA]
-env = "DHTTP_ROOT_CA"
+fn parse_contract(input: &str) -> Result<ReleaseContract, ParseContractError> {
+    let contract =
+        toml::from_str::<ReleaseContract>(input).context(parse_contract_error::ParseSnafu)?;
+    contract
+        .validate()
+        .context(parse_contract_error::ValidateSnafu)?;
+    Ok(contract)
+}
 
-[package.pishoo.build.env.DHTTP_GLOBAL_HOME]
-env = "DHTTP_GLOBAL_HOME"
-optional = true
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+enum ParseContractError {
+    #[snafu(display("failed to parse contract"))]
+    Parse { source: toml::de::Error },
+    #[snafu(display("failed to validate contract"))]
+    Validate { source: ValidateContractError },
+}
 
-[package.pishoo.brew.build.target.aarch64-apple-darwin.env.DHTTP_GLOBAL_HOME]
-value = "/opt/homebrew/etc/dhttp"
+fn planned_script(
+    invocation: &genmeta_xtask_release::plan::PlannedPackageInvocation,
+) -> Option<&std::path::Path> {
+    invocation.executor.script()
+}
 
-[package.pishoo.deb]
+fn planned_image(
+    invocation: &genmeta_xtask_release::plan::PlannedPackageInvocation,
+) -> Option<&str> {
+    match &invocation.executor {
+        genmeta_xtask_release::plan::PlannedPackageExecutor::DockerImage { image, .. } => {
+            Some(image.as_str())
+        }
+        genmeta_xtask_release::plan::PlannedPackageExecutor::LocalScript { .. } => None,
+    }
+}
+
+fn planned_dockerfile(
+    invocation: &genmeta_xtask_release::plan::PlannedPackageInvocation,
+) -> Option<&std::path::Path> {
+    invocation.executor.dockerfile()
+}
+
+fn dhttp_build_values(root_ca: &str) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([
+        ("DHTTP_ROOT_CA".to_string(), root_ca.to_string()),
+        ("DHTTP_STUN_SERVER".to_string(), "nat.example".to_string()),
+        (
+            "DHTTP_H3_DNS_SERVER".to_string(),
+            "https://dns.example:4433".to_string(),
+        ),
+        (
+            "DHTTP_HTTP_DNS_SERVER".to_string(),
+            "https://dns.example".to_string(),
+        ),
+        ("DHTTP_MDNS_SERVICE".to_string(), "_dhttp.local".to_string()),
+        (
+            "DHTTP_CERT_SERVER_URL".to_string(),
+            "https://license.example".to_string(),
+        ),
+    ])
+}
+
+#[test]
+fn canonical_gmutils_uses_final_package_executor_schema() {
+    let contract = load_fixture("gmutils.release.toml");
+    let gmutils = contract.package("gmutils").expect("gmutils package");
+
+    let deb = gmutils.deb.as_ref().expect("gmutils deb branch");
+    assert_eq!(
+        deb.dockerfile.as_deref(),
+        Some(Path::new("xtask/release/deb/Dockerfile"))
+    );
+
+    let brew = gmutils.brew.as_ref().expect("gmutils brew branch");
+    assert_eq!(
+        brew.script.as_deref(),
+        Some(Path::new("xtask/release/brew/gmutils.sh"))
+    );
+    assert_eq!(
+        brew.manifest_template.as_deref(),
+        Some(Path::new("xtask/templates/gmutils.rb.in"))
+    );
+
+    let scoop = gmutils.scoop.as_ref().expect("gmutils scoop branch");
+    assert_eq!(
+        scoop.script.as_deref(),
+        Some(Path::new("xtask/release/scoop/gmutils.sh"))
+    );
+    assert_eq!(
+        scoop.manifest_template.as_deref(),
+        Some(Path::new("xtask/templates/gmutils.json.in"))
+    );
+}
+
+#[test]
+fn canonical_gateway_uses_final_package_executor_schema() {
+    let contract = load_fixture("gateway.release.toml");
+    let pishoo = contract.package("pishoo").expect("pishoo package");
+    let common = contract
+        .package("pishoo-common")
+        .expect("pishoo-common package");
+
+    assert_eq!(
+        pishoo
+            .deb
+            .as_ref()
+            .and_then(|branch| branch.dockerfile.as_deref()),
+        Some(Path::new("xtask/release/deb/Dockerfile"))
+    );
+    assert_eq!(
+        common
+            .deb
+            .as_ref()
+            .and_then(|branch| branch.dockerfile.as_deref()),
+        Some(Path::new("xtask/release/deb/Dockerfile"))
+    );
+    assert_eq!(
+        pishoo
+            .brew
+            .as_ref()
+            .and_then(|branch| branch.manifest_template.as_deref()),
+        Some(Path::new("xtask/templates/pishoo.rb.in"))
+    );
+}
+
+#[test]
+fn rejects_linux_branch_script_executor() {
+    let error = parse_contract(
+        r#"
+[package.gmutils]
+manifest = "genmeta/Cargo.toml"
+
+[package.gmutils.deb]
 revision = "1"
 architecture = "target"
-
-[package.pishoo.deb.build]
-script = "xtask/release/deb/pishoo.sh"
-
-[package.pishoo.deb.build.container]
-dockerfile = "xtask/release/deb/Dockerfile"
-
-[package.pishoo.deb.requires.pishoo-common.version]
-">=" = { from = "dependency" }
-"<=" = { from = "self" }
-
-[package.pishoo.rpm]
-release = "1"
-architecture = "target"
-
-[package.pishoo.rpm.build]
-script = "xtask/release/rpm/pishoo.sh"
-
-[package.pishoo.rpm.build.container]
-dockerfile = "xtask/release/rpm/Dockerfile"
-
-[package.pishoo.rpm.requires.pishoo-common.version]
-">=" = { from = "dependency" }
-"<=" = { from = "self" }
-
-[package.pishoo.brew]
-template = "xtask/templates/pishoo.rb.in"
-
-[package.pishoo.brew.build]
-script = "xtask/release/brew/pishoo.sh"
-
-[package.pishoo-common]
-version = "0.5.1"
-description = "Common files for pishoo"
-license = "Apache-2.0"
-homepage = "https://dhttp.net"
-repository = "https://github.com/genmeta/gateway"
-
-[package.pishoo-common.deb]
-revision = "1"
-architecture = "all"
-
-[package.pishoo-common.deb.build]
-script = "xtask/release/deb/pishoo-common.sh"
-
-[package.pishoo-common.rpm]
-release = "1"
-architecture = "noarch"
-
-[package.pishoo-common.rpm.build]
-script = "xtask/release/rpm/pishoo-common.sh"
+script = "xtask/release/deb/gmutils.sh"
 
 [destination.s3]
 bucket = "download"
 endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
 access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
 secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
+"#,
+    )
+    .expect_err("linux package branches must reject script executors");
+    assert!(
+        snafu::Report::from_error(&error)
+            .to_string()
+            .contains("unknown field `script`")
+    );
+}
 
-[destination.s3.brew]
-prefix = "homebrew"
-public_base_url = "https://download.dhttp.net/homebrew"
-tap.repository = "genmeta/homebrew-genmeta"
-tap.base_branch = "main"
-tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+#[test]
+fn rejects_brew_branch_dockerfile_executor() {
+    let error = parse_contract(
+        r#"
+[package.gmutils]
+manifest = "genmeta/Cargo.toml"
 
-[destination.s3.deb]
-prefix = "ppa/genmeta"
-suite = "genmeta"
-signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
-signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
-fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
+[package.gmutils.brew]
+dockerfile = "xtask/release/brew/Dockerfile"
+manifest_template = "xtask/templates/gmutils.rb.in"
 
-[destination.s3.deb.publish]
-script = "xtask/release/publish/deb.sh"
+[destination.s3]
+bucket = "download"
+endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
+access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
+secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
+"#,
+    )
+    .expect_err("brew package branches must reject dockerfile executors");
+    assert!(
+        snafu::Report::from_error(&error)
+            .to_string()
+            .contains("unknown field `dockerfile`")
+    );
+}
 
-[destination.s3.deb.publish.container]
-dockerfile = "xtask/release/publish/deb/Dockerfile"
+#[test]
+fn rejects_scoop_without_manifest_template() {
+    let error = parse_contract(
+        r#"
+[package.gmutils]
+manifest = "genmeta/Cargo.toml"
 
-[destination.s3.rpm]
-prefix = "rpm/pishoo"
+[package.gmutils.scoop]
+script = "xtask/release/scoop/gmutils.sh"
 
-[destination.s3.rpm.publish]
-script = "xtask/release/publish/rpm.sh"
+[destination.s3]
+bucket = "download"
+endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
+access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
+secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
+"#,
+    )
+    .expect_err("scoop package branches require manifest_template");
+    assert!(
+        snafu::Report::from_error(&error)
+            .to_string()
+            .contains("scoop branch missing manifest_template")
+    );
+}
 
-[destination.s3.rpm.publish.container]
-dockerfile = "xtask/release/publish/rpm/Dockerfile"
-"#;
+#[test]
+fn rejects_old_scoop_bin_field() {
+    let error = parse_contract(
+        r#"
+[package.gmutils]
+manifest = "genmeta/Cargo.toml"
+
+[package.gmutils.scoop]
+script = "xtask/release/scoop/gmutils.sh"
+manifest_template = "xtask/templates/gmutils.json.in"
+bin = ["genmeta.exe"]
+
+[destination.s3]
+bucket = "download"
+endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
+access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
+secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
+"#,
+    )
+    .expect_err("scoop bin must live in the manifest template");
+    assert!(
+        snafu::Report::from_error(&error)
+            .to_string()
+            .contains("unknown field `bin`")
+    );
+}
 
 #[test]
 fn gateway_contract_places_common_only_under_deb_and_rpm() {
@@ -145,10 +279,8 @@ value = "/opt/sample"
 optional = true
 
 [package.sample.brew]
-template = "xtask/templates/sample.rb.in"
-
-[package.sample.brew.build]
 script = "xtask/release/brew/sample.sh"
+manifest_template = "xtask/templates/sample.rb.in"
 
 [destination.s3]
 bucket = "download"
@@ -175,10 +307,8 @@ fn destination_env_ref_must_not_be_empty() {
 manifest = "sample/Cargo.toml"
 
 [package.sample.brew]
-template = "xtask/templates/sample.rb.in"
-
-[package.sample.brew.build]
 script = "xtask/release/brew/sample.sh"
+manifest_template = "xtask/templates/sample.rb.in"
 
 [destination.s3]
 bucket = "download"
@@ -199,7 +329,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 }
 
 use genmeta_xtask_release::{
-    plan::{BuildSelectionRequest, select_build_branches},
+    plan::{PackageSelectionRequest, select_package_branches},
     system::RequestedTarget,
 };
 
@@ -209,9 +339,9 @@ fn common_target_selects_architecture_class_not_package_name() {
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
 
-    let deb = select_build_branches(
+    let deb = select_package_branches(
         &contract,
-        BuildSelectionRequest {
+        PackageSelectionRequest {
             system: PackageSystem::Deb,
             targets: vec![RequestedTarget::Common],
             features: Vec::new(),
@@ -225,9 +355,9 @@ fn common_target_selects_architecture_class_not_package_name() {
         vec!["pishoo-common"]
     );
 
-    let rpm = select_build_branches(
+    let rpm = select_package_branches(
         &contract,
-        BuildSelectionRequest {
+        PackageSelectionRequest {
             system: PackageSystem::Rpm,
             targets: vec![RequestedTarget::Common],
             features: Vec::new(),
@@ -248,9 +378,9 @@ fn build_selection_preserves_each_matching_target() {
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
 
-    let selected = select_build_branches(
+    let selected = select_package_branches(
         &contract,
-        BuildSelectionRequest {
+        PackageSelectionRequest {
             system: PackageSystem::Deb,
             targets: vec![
                 RequestedTarget::Common,
@@ -349,9 +479,7 @@ homepage = "https://dhttp.net"
 [package.sample-tool.deb]
 revision = "1"
 architecture = "target"
-
-[package.sample-tool.deb.build]
-script = "xtask/release/deb/sample-tool.sh"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [package.sample-tool.deb.requires.sample-lib.version]
 ">=" = { from = "dependency" }
@@ -362,9 +490,7 @@ manifest = "sample-lib/Cargo.toml"
 [package.sample-lib.deb]
 revision = "2"
 architecture = "all"
-
-[package.sample-lib.deb.build]
-script = "xtask/release/deb/sample-lib.sh"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [destination.s3]
 bucket = "download"
@@ -418,9 +544,7 @@ manifest = "sample-tool/Cargo.toml"
 [package.sample-tool.rpm]
 release = "3"
 architecture = "target"
-
-[package.sample-tool.rpm.build]
-script = "xtask/release/rpm/sample-tool.sh"
+dockerfile = "xtask/release/rpm/Dockerfile"
 
 [package.sample-tool.rpm.requires.sample-lib.version]
 "<=" = { from = "self" }
@@ -434,9 +558,7 @@ homepage = "https://dhttp.net"
 [package.sample-lib.rpm]
 release = "1"
 architecture = "noarch"
-
-[package.sample-lib.rpm.build]
-script = "xtask/release/rpm/sample-lib.sh"
+dockerfile = "xtask/release/rpm/Dockerfile"
 
 [destination.s3]
 bucket = "download"
@@ -524,36 +646,37 @@ fn linux_requires_reject_non_linux_package_systems() {
 }
 
 #[test]
-fn build_invocation_uses_script_and_container_from_contract() {
+fn package_invocation_uses_script_and_container_from_contract() {
     let contract: ReleaseContract =
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
 
-    let plan = genmeta_xtask_release::plan::build_invocation_for(
+    let plan = genmeta_xtask_release::plan::package_invocation_for(
         &contract,
         "pishoo",
         PackageSystem::Deb,
         RequestedTarget::Triple("x86_64-unknown-linux-gnu".to_string()),
         &["pam".to_string()],
     )
-    .expect("build invocation should plan");
+    .expect("package invocation should plan");
 
-    assert_eq!(plan.script.to_string_lossy(), "xtask/release/deb/pishoo.sh");
     assert_eq!(
-        plan.container
-            .as_ref()
-            .map(|container| container.image.as_str()),
-        Some("xtask-release:build-pishoo-deb")
+        planned_image(&plan),
+        Some("xtask-release:package-pishoo-deb")
+    );
+    assert_eq!(
+        planned_dockerfile(&plan),
+        Some(std::path::Path::new("xtask/release/deb/Dockerfile"))
     );
 }
 
 #[test]
-fn build_invocation_keeps_branch_open_when_only_some_targets_have_env_overrides() {
+fn package_invocation_keeps_branch_open_when_only_some_targets_have_env_overrides() {
     let contract: ReleaseContract =
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
 
-    let plan = genmeta_xtask_release::plan::build_invocation_for(
+    let plan = genmeta_xtask_release::plan::package_invocation_for(
         &contract,
         "pishoo",
         PackageSystem::Brew,
@@ -563,7 +686,9 @@ fn build_invocation_keeps_branch_open_when_only_some_targets_have_env_overrides(
     .expect("target without explicit env override should still plan");
 
     assert_eq!(
-        plan.script.to_string_lossy(),
+        planned_script(&plan)
+            .expect("script executor")
+            .to_string_lossy(),
         "xtask/release/brew/pishoo.sh"
     );
     assert_eq!(
@@ -660,81 +785,7 @@ fn sibling_container_plan_mounts_cli_sources_and_writes_container_patch_config()
     );
 }
 
-const GMUTILS_CONTRACT: &str = r#"
-[package.gmutils]
-manifest = "genmeta/Cargo.toml"
-
-[package.gmutils.deb]
-revision = "1"
-architecture = "target"
-
-[package.gmutils.deb.build]
-script = "xtask/release/deb/gmutils.sh"
-
-[package.gmutils.deb.build.container]
-dockerfile = "xtask/release/deb/Dockerfile"
-
-[package.gmutils.rpm]
-release = "1"
-architecture = "target"
-
-[package.gmutils.rpm.build]
-script = "xtask/release/rpm/gmutils.sh"
-
-[package.gmutils.rpm.build.container]
-dockerfile = "xtask/release/rpm/Dockerfile"
-
-[package.gmutils.brew]
-template = "xtask/templates/gmutils.rb.in"
-
-[package.gmutils.brew.build]
-script = "xtask/release/brew/gmutils.sh"
-
-[package.gmutils.scoop]
-bin = ["genmeta.exe", "genmeta-ssh.bat"]
-
-[package.gmutils.scoop.build]
-script = "xtask/release/scoop/gmutils.sh"
-
-[destination.s3]
-bucket = "download"
-endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
-access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
-secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
-
-[destination.s3.brew]
-prefix = "homebrew"
-public_base_url = "https://download.dhttp.net/homebrew"
-tap.repository = "genmeta/homebrew-genmeta"
-tap.base_branch = "main"
-tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
-
-[destination.s3.scoop]
-prefix = "scoop"
-public_base_url = "https://download.dhttp.net/scoop"
-
-[destination.s3.deb]
-prefix = "ppa/genmeta"
-suite = "genmeta"
-signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
-signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
-fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
-
-[destination.s3.deb.publish]
-script = "xtask/release/publish/deb.sh"
-
-[destination.s3.deb.publish.container]
-dockerfile = "xtask/release/publish/deb/Dockerfile"
-
-[destination.s3.rpm]
-prefix = "rpm/gmutils"
-
-[destination.s3.rpm.publish]
-script = "xtask/release/publish/rpm.sh"
-
-[destination.s3.rpm.publish.container]
-dockerfile = "xtask/release/publish/rpm/Dockerfile"
-"#;
+const GMUTILS_CONTRACT: &str = include_str!("fixtures/gmutils.release.toml");
 
 #[test]
 fn gmutils_contract_has_scoop_and_no_common_target() {
@@ -745,9 +796,9 @@ fn gmutils_contract_has_scoop_and_no_common_target() {
     let gmutils = contract.package("gmutils").expect("gmutils package exists");
     assert!(gmutils.branch(PackageSystem::Scoop).is_some());
 
-    let common = select_build_branches(
+    let common = select_package_branches(
         &contract,
-        BuildSelectionRequest {
+        PackageSelectionRequest {
             system: PackageSystem::Deb,
             targets: vec![RequestedTarget::Common],
             features: Vec::new(),
@@ -809,9 +860,7 @@ homepage = "https://dhttp.net"
 [package.pishoo-common.deb]
 revision = "1"
 architecture = "all"
-
-[package.pishoo-common.deb.build]
-script = "xtask/release/deb/pishoo-common.sh"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [destination.s3]
 bucket = "download"
@@ -839,12 +888,10 @@ homepage = "https://dhttp.net"
 [package.sample-tool.deb]
 revision = "1"
 architecture = "target"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [package.sample-tool.deb.requires.sample-common.version]
 ">=" = { from = "dependency" }
-
-[package.sample-tool.deb.build]
-script = "xtask/release/deb/sample-tool.sh"
 
 [destination.s3]
 bucket = "download"
@@ -872,14 +919,13 @@ description = "Sample tool"
 license = "Apache-2.0"
 homepage = "https://dhttp.net"
 
-[package.sample-tool.brew]
-template = "xtask/templates/sample-tool.rb.in"
+[package.sample-tool.deb]
+revision = "1"
+architecture = "target"
+dockerfile = "xtask/release/deb/Dockerfile"
 
-[package.sample-tool.brew.requires.sample-common.version]
+[package.sample-tool.deb.requires.sample-common.version]
 ">=" = { from = "dependency" }
-
-[package.sample-tool.brew.build]
-script = "xtask/release/brew/sample-tool.sh"
 
 [package.sample-common]
 version = "1.0.0"
@@ -887,12 +933,10 @@ description = "Sample common files"
 license = "Apache-2.0"
 homepage = "https://dhttp.net"
 
-[package.sample-common.deb]
-revision = "1"
-architecture = "all"
-
-[package.sample-common.deb.build]
-script = "xtask/release/deb/sample-common.sh"
+[package.sample-common.rpm]
+release = "1"
+architecture = "noarch"
+dockerfile = "xtask/release/rpm/Dockerfile"
 
 [destination.s3]
 bucket = "download"
@@ -907,150 +951,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
         .expect_err("missing required branch should fail");
     assert_eq!(
         error.to_string(),
-        "package sample-tool brew branch requires package sample-common without brew branch"
-    );
-}
-
-#[test]
-fn deb_destination_requires_publish_script() {
-    let input = r#"
-[package.sample]
-version = "1.2.3"
-description = "Sample"
-license = "Apache-2.0"
-homepage = "https://dhttp.net"
-
-[package.sample.deb]
-revision = "1"
-architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
-
-[destination.s3]
-bucket = "download"
-endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
-access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
-secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
-
-[destination.s3.deb]
-prefix = "ppa/sample"
-suite = "sample"
-signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
-signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
-fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
-"#;
-
-    let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
-    let error = contract
-        .validate()
-        .expect_err("deb destination without publish script should fail");
-
-    assert_eq!(
-        error.to_string(),
-        "destination s3 deb branch missing publish script"
-    );
-}
-
-#[test]
-fn rpm_destination_requires_publish_script() {
-    let input = r#"
-[package.sample]
-version = "1.2.3"
-description = "Sample"
-license = "Apache-2.0"
-homepage = "https://dhttp.net"
-
-[package.sample.rpm]
-release = "1"
-architecture = "target"
-
-[package.sample.rpm.build]
-script = "xtask/release/rpm/sample.sh"
-
-[destination.s3]
-bucket = "download"
-endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
-access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
-secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
-
-[destination.s3.rpm]
-prefix = "rpm/sample"
-"#;
-
-    let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
-    let error = contract
-        .validate()
-        .expect_err("rpm destination without publish script should fail");
-
-    assert_eq!(
-        error.to_string(),
-        "destination s3 rpm branch missing publish script"
-    );
-}
-
-#[test]
-fn deb_destination_rejects_empty_publish_script() {
-    let input = r#"
-[package.sample]
-version = "1.2.3"
-description = "Sample"
-license = "Apache-2.0"
-homepage = "https://dhttp.net"
-
-[package.sample.deb]
-revision = "1"
-architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
-
-[destination.s3]
-bucket = "download"
-endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
-access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
-secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
-
-[destination.s3.deb]
-prefix = "ppa/sample"
-suite = "sample"
-signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
-signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
-fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
-
-[destination.s3.deb.publish]
-script = ""
-"#;
-
-    let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
-    let error = contract
-        .validate()
-        .expect_err("empty deb publish script should fail");
-
-    assert_eq!(
-        error.to_string(),
-        "destination s3 deb branch missing publish script"
-    );
-}
-
-#[test]
-fn publish_invocation_uses_destination_system_branch() {
-    let contract: ReleaseContract =
-        toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
-    contract.validate().expect("contract should validate");
-
-    let plan = genmeta_xtask_release::plan::publish_invocation_for(&contract, PackageSystem::Rpm)
-        .expect("rpm publish should plan");
-
-    assert_eq!(
-        plan.script.to_string_lossy(),
-        "xtask/release/publish/rpm.sh"
-    );
-    assert_eq!(
-        plan.container
-            .as_ref()
-            .map(|container| container.image.as_str()),
-        Some("xtask-release:publish-rpm")
+        "package sample-tool deb branch requires package sample-common without deb branch"
     );
 }
 
@@ -1189,13 +1090,7 @@ fn s3_publish_command_plan_connects_cli_systems_to_targets_and_scripts() {
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].system, PackageSystem::Deb);
     assert!(plans[0].dry_run);
-    assert_eq!(
-        plans[0]
-            .invocation
-            .as_ref()
-            .map(|invocation| invocation.script.to_string_lossy().into_owned()),
-        Some("xtask/release/publish/deb.sh".to_string())
-    );
+    assert_eq!(plans[0].invocation.as_ref(), None);
     match &plans[0].target {
         genmeta_xtask_release::publish::S3PublishTarget::Deb(target) => {
             assert_eq!(target.prefix.as_str(), "ppa/genmeta");
@@ -1246,10 +1141,8 @@ repository = "https://github.com/genmeta/sample-tool"
 manifest = {manifest:?}
 
 [package.sample-tool.brew]
-template = "xtask/templates/sample-tool.rb.in"
-
-[package.sample-tool.brew.build]
 script = "xtask/release/brew/sample-tool.sh"
+manifest_template = "xtask/templates/sample-tool.rb.in"
 
 [destination.s3]
 bucket = "download"
@@ -1307,19 +1200,17 @@ fn explicit_package_metadata_resolves_non_cargo_package() {
 }
 
 #[test]
-fn build_invocation_resolves_package_env_and_target_override() {
+fn package_invocation_resolves_package_env_and_target_override() {
     let contract: ReleaseContract =
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
-    let values = std::collections::BTreeMap::from([
-        ("DHTTP_ROOT_CA".to_string(), "/tmp/root.crt".to_string()),
-        (
-            "DHTTP_GLOBAL_HOME".to_string(),
-            "/runtime/should-be-overridden".to_string(),
-        ),
-    ]);
+    let mut values = dhttp_build_values("/tmp/root.crt");
+    values.insert(
+        "DHTTP_GLOBAL_HOME".to_string(),
+        "/runtime/should-be-overridden".to_string(),
+    );
 
-    let plan = genmeta_xtask_release::plan::build_invocation_with_env_values(
+    let plan = genmeta_xtask_release::plan::package_invocation_with_env_values(
         &contract,
         "pishoo",
         PackageSystem::Brew,
@@ -1327,7 +1218,7 @@ fn build_invocation_resolves_package_env_and_target_override() {
         &[],
         &values,
     )
-    .expect("build invocation should plan");
+    .expect("package invocation should plan");
 
     assert_eq!(
         plan.env.get("DHTTP_ROOT_CA").map(String::as_str),
@@ -1344,12 +1235,9 @@ fn optional_build_env_is_skipped_when_missing() {
     let contract: ReleaseContract =
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
-    let values = std::collections::BTreeMap::from([(
-        "DHTTP_ROOT_CA".to_string(),
-        "/tmp/root.crt".to_string(),
-    )]);
+    let values = dhttp_build_values("/tmp/root.crt");
 
-    let plan = genmeta_xtask_release::plan::build_invocation_with_env_values(
+    let plan = genmeta_xtask_release::plan::package_invocation_with_env_values(
         &contract,
         "pishoo",
         PackageSystem::Deb,
@@ -1357,11 +1245,11 @@ fn optional_build_env_is_skipped_when_missing() {
         &[],
         &values,
     )
-    .expect("build invocation should plan");
+    .expect("package invocation should plan");
 
     assert_eq!(
         plan.env.get("DHTTP_ROOT_CA").map(String::as_str),
-        Some("/tmp/root.crt")
+        Some("/dhttp-bootstrap/root.crt")
     );
     assert!(!plan.env.contains_key("DHTTP_GLOBAL_HOME"));
 }
@@ -1376,12 +1264,10 @@ manifest = "sample/Cargo.toml"
 env = "DHTTP_GLOBAL_HOME"
 
 [package.sample.brew]
-template = "xtask/templates/sample.rb.in"
-
-[package.sample.brew.build]
 script = "xtask/release/brew/sample.sh"
+manifest_template = "xtask/templates/sample.rb.in"
 
-[package.sample.brew.build.target.aarch64-apple-darwin.env.DHTTP_GLOBAL_HOME]
+[package.sample.brew.target.aarch64-apple-darwin.env.DHTTP_GLOBAL_HOME]
 env = "TARGET_DHTTP_GLOBAL_HOME"
 optional = true
 
@@ -1398,7 +1284,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
         "/package/default".to_string(),
     )]);
 
-    let plan = genmeta_xtask_release::plan::build_invocation_with_env_values(
+    let plan = genmeta_xtask_release::plan::package_invocation_with_env_values(
         &contract,
         "sample",
         PackageSystem::Brew,
@@ -1406,7 +1292,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
         &[],
         &values,
     )
-    .expect("build invocation should plan");
+    .expect("package invocation should plan");
 
     assert!(!plan.env.contains_key("DHTTP_GLOBAL_HOME"));
 }
@@ -1426,11 +1312,9 @@ env = "CONFIG_DIR"
 [package.sample-common.deb]
 revision = "1"
 architecture = "all"
+dockerfile = "xtask/release/deb/Dockerfile"
 
-[package.sample-common.deb.build]
-script = "xtask/release/deb/sample-common.sh"
-
-[package.sample-common.deb.build.target.common.env.CONFIG_DIR]
+[package.sample-common.deb.target.common.env.CONFIG_DIR]
 value = "/usr/share/sample"
 
 [destination.s3]
@@ -1444,7 +1328,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
     let values =
         std::collections::BTreeMap::from([("CONFIG_DIR".to_string(), "/runtime".to_string())]);
 
-    let plan = genmeta_xtask_release::plan::build_invocation_with_env_values(
+    let plan = genmeta_xtask_release::plan::package_invocation_with_env_values(
         &contract,
         "sample-common",
         PackageSystem::Deb,
@@ -1452,7 +1336,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
         &[],
         &values,
     )
-    .expect("common build invocation should plan");
+    .expect("common package invocation should plan");
     let names = genmeta_xtask_release::plan::build_env_names(
         &contract,
         "sample-common",
@@ -1637,7 +1521,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 }
 
 #[test]
-fn build_container_can_be_defined_by_dockerfile() {
+fn package_docker_executor_can_be_defined_by_dockerfile() {
     let input = r#"
 [package.sample]
 manifest = "sample/Cargo.toml"
@@ -1645,11 +1529,6 @@ manifest = "sample/Cargo.toml"
 [package.sample.deb]
 revision = "1"
 architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
-
-[package.sample.deb.build.container]
 dockerfile = "xtask/release/deb/Dockerfile"
 
 [destination.s3]
@@ -1661,71 +1540,22 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
     let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
     contract.validate().expect("contract should validate");
 
-    let plan = genmeta_xtask_release::plan::build_invocation_for(
+    let plan = genmeta_xtask_release::plan::package_invocation_for(
         &contract,
         "sample",
         PackageSystem::Deb,
         RequestedTarget::Triple("x86_64-unknown-linux-gnu".to_string()),
         &[],
     )
-    .expect("dockerfile container build should plan");
+    .expect("dockerfile container package should plan");
 
-    let container = plan.container.expect("container should be planned");
-    assert_eq!(container.image, "xtask-release:build-sample-deb");
     assert_eq!(
-        container
-            .build
-            .expect("container image build should be planned")
-            .dockerfile,
-        std::path::PathBuf::from("xtask/release/deb/Dockerfile")
+        planned_image(&plan),
+        Some("xtask-release:package-sample-deb")
     );
-}
-
-#[test]
-fn publish_container_can_be_defined_by_dockerfile() {
-    let input = r#"
-[package.sample]
-manifest = "sample/Cargo.toml"
-
-[package.sample.deb]
-revision = "1"
-architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
-
-[destination.s3]
-bucket = "download"
-endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
-access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
-secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
-
-[destination.s3.deb]
-prefix = "ppa/sample"
-suite = "sample"
-signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
-signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
-
-[destination.s3.deb.publish]
-script = "xtask/release/publish/deb.sh"
-
-[destination.s3.deb.publish.container]
-dockerfile = "xtask/release/publish/deb/Dockerfile"
-"#;
-    let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
-    contract.validate().expect("contract should validate");
-
-    let plan = genmeta_xtask_release::plan::publish_invocation_for(&contract, PackageSystem::Deb)
-        .expect("dockerfile container publish should plan");
-
-    let container = plan.container.expect("container should be planned");
-    assert_eq!(container.image, "xtask-release:publish-deb");
     assert_eq!(
-        container
-            .build
-            .expect("container image build should be planned")
-            .dockerfile,
-        std::path::PathBuf::from("xtask/release/publish/deb/Dockerfile")
+        planned_dockerfile(&plan),
+        Some(std::path::Path::new("xtask/release/deb/Dockerfile"))
     );
 }
 
@@ -1738,9 +1568,7 @@ manifest = "sample/Cargo.toml"
 [package.sample.deb]
 revision = "1"
 architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [package.sample.deb.build.feature.pam]
 script = "xtask/release/deb/sample-pam.sh"
@@ -1754,20 +1582,21 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 
     let error = toml::from_str::<ReleaseContract>(input)
         .expect_err("feature script table should be rejected");
-    assert!(error.to_string().contains("feature"));
+    assert!(
+        snafu::Report::from_error(&error)
+            .to_string()
+            .contains("feature")
+    );
 }
 
 #[test]
-fn build_invocation_includes_generic_script_environment() {
+fn package_invocation_includes_generic_script_environment() {
     let contract: ReleaseContract =
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
-    let values = std::collections::BTreeMap::from([(
-        "DHTTP_ROOT_CA".to_string(),
-        "/tmp/root.crt".to_string(),
-    )]);
+    let values = dhttp_build_values("/tmp/root.crt");
 
-    let plan = genmeta_xtask_release::plan::build_invocation_with_env_values(
+    let plan = genmeta_xtask_release::plan::package_invocation_with_env_values(
         &contract,
         "pishoo",
         PackageSystem::Deb,
@@ -1775,7 +1604,7 @@ fn build_invocation_includes_generic_script_environment() {
         &["pam".to_string()],
         &values,
     )
-    .expect("build invocation should plan");
+    .expect("package invocation should plan");
 
     assert_eq!(
         plan.env.get("XTASK_RELEASE_PACKAGE_ID").map(String::as_str),
@@ -1796,12 +1625,12 @@ fn build_invocation_includes_generic_script_environment() {
 }
 
 #[test]
-fn build_invocation_for_profile_sets_script_profile_environment() {
+fn package_invocation_for_profile_sets_script_profile_environment() {
     let contract: ReleaseContract =
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
 
-    let plan = genmeta_xtask_release::plan::build_invocation_for_profile(
+    let plan = genmeta_xtask_release::plan::package_invocation_for_profile(
         &contract,
         "pishoo",
         PackageSystem::Deb,
@@ -1809,7 +1638,7 @@ fn build_invocation_for_profile_sets_script_profile_environment() {
         genmeta_xtask_release::system::BuildProfile::Debug,
         &[],
     )
-    .expect("debug build invocation should plan");
+    .expect("debug package invocation should plan");
 
     assert_eq!(
         plan.env.get("XTASK_RELEASE_PROFILE").map(String::as_str),
@@ -1818,16 +1647,13 @@ fn build_invocation_for_profile_sets_script_profile_environment() {
 }
 
 #[test]
-fn build_invocation_for_profile_with_env_values_preserves_profile_and_resolves_env() {
+fn package_invocation_for_profile_with_env_values_preserves_profile_and_resolves_env() {
     let contract: ReleaseContract =
         toml::from_str(GATEWAY_CONTRACT).expect("contract should parse");
     contract.validate().expect("contract should validate");
-    let values = std::collections::BTreeMap::from([(
-        "DHTTP_ROOT_CA".to_string(),
-        "/tmp/root.crt".to_string(),
-    )]);
+    let values = dhttp_build_values("/tmp/root.crt");
 
-    let plan = genmeta_xtask_release::plan::build_invocation_for_profile_with_env_values(
+    let plan = genmeta_xtask_release::plan::package_invocation_for_profile_with_env_values(
         &contract,
         "pishoo",
         PackageSystem::Deb,
@@ -1836,7 +1662,7 @@ fn build_invocation_for_profile_with_env_values_preserves_profile_and_resolves_e
         &["pam".to_string()],
         &values,
     )
-    .expect("debug build invocation with env values should plan");
+    .expect("debug package invocation with env values should plan");
 
     assert_eq!(
         plan.env.get("XTASK_RELEASE_PROFILE").map(String::as_str),
@@ -1844,7 +1670,7 @@ fn build_invocation_for_profile_with_env_values_preserves_profile_and_resolves_e
     );
     assert_eq!(
         plan.env.get("DHTTP_ROOT_CA").map(String::as_str),
-        Some("/tmp/root.crt")
+        Some("/dhttp-bootstrap/root.crt")
     );
     assert_eq!(
         plan.env.get("XTASK_RELEASE_FEATURES").map(String::as_str),
@@ -1878,10 +1704,7 @@ fn package_command_invocations_connect_cli_sections_to_selected_package_builds()
         ],
     )
     .expect("package command should parse");
-    let values = std::collections::BTreeMap::from([(
-        "DHTTP_ROOT_CA".to_string(),
-        "/workspace/root.crt".to_string(),
-    )]);
+    let values = dhttp_build_values("/workspace/root.crt");
 
     let builds =
         genmeta_xtask_release::plan::package_command_invocations(&contract, &command, &values)
@@ -2273,9 +2096,7 @@ homepage = "https://dhttp.net"
 [package.sample.deb]
 revision = "1"
 architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [destination.s3]
 bucket = "download"
@@ -2290,8 +2111,6 @@ signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
 signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
 fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
 
-[destination.s3.deb.publish]
-script = "xtask/release/publish/deb.sh"
 "#;
     let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
     contract.validate().expect("contract should validate");
@@ -4005,38 +3824,6 @@ fn linux_package_systems_do_not_have_package_entry_names() {
 use genmeta_xtask_release::scoop::{render_scoop_json, scoop_template_variables};
 
 #[test]
-fn scoop_branch_bin_is_package_system_contract_data() {
-    let input = r#"
-[package.sample-tool]
-version = "1.2.3"
-description = "Sample tool"
-license = "Apache-2.0"
-homepage = "https://dhttp.net"
-
-[package.sample-tool.scoop]
-bin = ["sample-tool.exe", "sample-helper.bat"]
-
-[package.sample-tool.scoop.build]
-script = "build-scoop.sh"
-
-[destination.s3]
-bucket = "download"
-endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
-access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
-secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
-"#;
-
-    let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
-    contract.validate().expect("contract should validate");
-
-    let branch = contract
-        .package("sample-tool")
-        .and_then(|package| package.scoop.as_ref())
-        .expect("scoop branch should exist");
-    assert_eq!(branch.bin, vec!["sample-tool.exe", "sample-helper.bat"]);
-}
-
-#[test]
 fn scoop_template_variables_expose_manifest_and_branch_values() {
     let package_id = PackageId::new("sample-tool").expect("package id should parse");
     let metadata = ResolvedPackageMetadata {
@@ -4206,10 +3993,8 @@ license = "Apache-2.0"
 homepage = "https://dhttp.net"
 
 [package.sample.brew]
-template = "sample.rb.in"
-
-[package.sample.brew.build]
 script = "build-brew.sh"
+manifest_template = "sample.rb.in"
 
 [destination.s3]
 bucket = "download"
@@ -4260,9 +4045,7 @@ homepage = "https://dhttp.net"
 [package.sample.deb]
 revision = "1"
 architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [destination.s3]
 bucket = "download"
@@ -4299,18 +4082,12 @@ container_path = "/container/root.crt"
 [package.sample.deb]
 revision = "1"
 architecture = "target"
+dockerfile = "xtask/release/deb/Dockerfile"
 
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
-
-[package.sample.deb.build.container]
-image = "linux-builder"
 
 [package.sample.brew]
-template = "xtask/templates/sample.rb.in"
-
-[package.sample.brew.build]
 script = "xtask/release/brew/sample.sh"
+manifest_template = "xtask/templates/sample.rb.in"
 
 [destination.s3]
 bucket = "download"
@@ -4323,7 +4100,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
     let values =
         std::collections::BTreeMap::from([("ROOT_CA".to_string(), "/host/root.crt".to_string())]);
 
-    let deb = genmeta_xtask_release::plan::build_invocation_for_profile_with_env_values(
+    let deb = genmeta_xtask_release::plan::package_invocation_for_profile_with_env_values(
         &contract,
         "sample",
         PackageSystem::Deb,
@@ -4332,7 +4109,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
         &[],
         &values,
     )
-    .expect("container build should plan");
+    .expect("container package should plan");
 
     assert_eq!(
         deb.env.get("ROOT_CA").map(String::as_str),
@@ -4347,7 +4124,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
         }]
     );
 
-    let brew = genmeta_xtask_release::plan::build_invocation_for_profile_with_env_values(
+    let brew = genmeta_xtask_release::plan::package_invocation_for_profile_with_env_values(
         &contract,
         "sample",
         PackageSystem::Brew,
@@ -4356,7 +4133,7 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
         &[],
         &values,
     )
-    .expect("non-container build should plan");
+    .expect("non-container package should plan");
 
     assert_eq!(
         brew.env.get("ROOT_CA").map(String::as_str),
@@ -4378,12 +4155,8 @@ container_path = "/container/root.crt"
 [package.sample.deb]
 revision = "1"
 architecture = "target"
+dockerfile = "xtask/release/deb/Dockerfile"
 
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
-
-[package.sample.deb.build.container]
-image = "linux-builder"
 
 [destination.s3]
 bucket = "download"

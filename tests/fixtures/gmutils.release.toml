@@ -27,41 +27,26 @@ optional = true
 [package.gmutils.deb]
 revision = "1"
 architecture = "target"
-
-[package.gmutils.deb.build]
-script = "xtask/release/deb/gmutils.sh"
-
-[package.gmutils.deb.build.container]
 dockerfile = "xtask/release/deb/Dockerfile"
 
 [package.gmutils.rpm]
 release = "1"
 architecture = "target"
-
-[package.gmutils.rpm.build]
-script = "xtask/release/rpm/gmutils.sh"
-
-[package.gmutils.rpm.build.container]
 dockerfile = "xtask/release/rpm/Dockerfile"
 
 [package.gmutils.brew]
-template = "xtask/templates/gmutils.rb.in"
-
-[package.gmutils.brew.build]
 script = "xtask/release/brew/gmutils.sh"
+manifest_template = "xtask/templates/gmutils.rb.in"
 
-[package.gmutils.brew.build.target.aarch64-apple-darwin.env.DHTTP_GLOBAL_HOME]
+[package.gmutils.brew.target.aarch64-apple-darwin.env.DHTTP_GLOBAL_HOME]
 value = "/opt/homebrew/etc/dhttp"
 
-[package.gmutils.brew.build.target.x86_64-apple-darwin.env.DHTTP_GLOBAL_HOME]
+[package.gmutils.brew.target.x86_64-apple-darwin.env.DHTTP_GLOBAL_HOME]
 value = "/usr/local/etc/dhttp"
 
 [package.gmutils.scoop]
-bin = ["genmeta.exe", "genmeta-ssh.bat"]
-template = "xtask/templates/gmutils.json.in"
-
-[package.gmutils.scoop.build]
 script = "xtask/release/scoop/gmutils.sh"
+manifest_template = "xtask/templates/gmutils.json.in"
 
 [destination.s3]
 bucket = "download"
@@ -87,17 +72,5 @@ signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
 signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
 fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
 
-[destination.s3.deb.publish]
-script = "xtask/release/publish/deb.sh"
-
-[destination.s3.deb.publish.container]
-dockerfile = "xtask/release/publish/deb/Dockerfile"
-
 [destination.s3.rpm]
 prefix = "rpm/gmutils"
-
-[destination.s3.rpm.publish]
-script = "xtask/release/publish/rpm.sh"
-
-[destination.s3.rpm.publish.container]
-dockerfile = "xtask/release/publish/rpm/Dockerfile"

@@ -13,7 +13,7 @@ use crate::{
     cli::{PackageCommandRequest, S3PublishCommandRequest},
     contract::{PackageBranchRef, ReleaseContract},
     package::PackageVersion,
-    plan::{BuildSelectionRequest, SelectBuildError, select_build_branches},
+    plan::{PackageSelectionRequest, SelectPackageError, select_package_branches},
     system::{PackageSystem, RequestedTarget},
 };
 
@@ -297,9 +297,9 @@ pub fn validate_package_command_manifest(
         if build.system != manifest.kind {
             continue;
         }
-        let selected = select_build_branches(
+        let selected = select_package_branches(
             contract,
-            BuildSelectionRequest {
+            PackageSelectionRequest {
                 system: build.system,
                 targets: build.args.targets.clone(),
                 features: build.args.features.clone(),
@@ -563,7 +563,7 @@ pub enum ValidatePackageCommandManifestError {
     MissingSystem { system: PackageSystem },
     #[snafu(display("failed to select package builds for {system}"))]
     Select {
-        source: SelectBuildError,
+        source: SelectPackageError,
         system: PackageSystem,
     },
     #[snafu(display("failed to validate package manifest targets"))]

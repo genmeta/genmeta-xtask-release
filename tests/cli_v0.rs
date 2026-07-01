@@ -458,9 +458,7 @@ manifest = "sample/Cargo.toml"
 [package.sample.deb]
 revision = "1"
 architecture = "target"
-
-[package.sample.deb.build]
-script = "xtask/release/deb/sample.sh"
+dockerfile = "xtask/release/deb/Dockerfile"
 
 [destination.s3]
 bucket = "download"

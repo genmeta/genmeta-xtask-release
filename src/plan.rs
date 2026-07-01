@@ -1,31 +1,38 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
+
 use snafu::{ResultExt, Snafu};
 
 use crate::{
     cli::{PackageCommandRequest, S3PublishCommandRequest},
-    contract::{ContainerContract, PackageBranchRef, ReleaseContract},
+    contract::{PackageBranchRef, ReleaseContract},
     package::PackageId,
     publish::S3PublishTarget,
     sibling::{ContainerOverlayPlan, SiblingSource},
     system::{ArchitectureClass, BuildProfile, PackageSystem, RequestedTarget},
 };
 
-pub struct BuildSelectionRequest {
+pub const PACKAGE_ENTRYPOINT: &str = "/opt/genmeta-release/package";
+
+pub struct PackageSelectionRequest {
     pub system: PackageSystem,
     pub targets: Vec<RequestedTarget>,
     pub features: Vec<String>,
 }
 
-pub struct SelectedBuildBranch<'a> {
+pub struct SelectedPackageBranch<'a> {
     pub package_id: &'a PackageId,
     pub system: PackageSystem,
     pub target: RequestedTarget,
     pub branch: PackageBranchRef<'a>,
 }
 
-pub fn select_build_branches(
+pub fn select_package_branches(
     contract: &ReleaseContract,
-    request: BuildSelectionRequest,
-) -> Result<Vec<SelectedBuildBranch<'_>>, SelectBuildError> {
+    request: PackageSelectionRequest,
+) -> Result<Vec<SelectedPackageBranch<'_>>, SelectPackageError> {
     let mut selected = Vec::new();
     for (package_id, package) in &contract.package {
         let Some(branch) = package.branch(request.system) else {
@@ -33,7 +40,7 @@ pub fn select_build_branches(
         };
         for target in &request.targets {
             if target_matches_branch(target, branch) {
-                selected.push(SelectedBuildBranch {
+                selected.push(SelectedPackageBranch {
                     package_id,
                     system: request.system,
                     target: target.clone(),
@@ -44,7 +51,7 @@ pub fn select_build_branches(
     }
 
     if selected.is_empty() {
-        return Err(SelectBuildError::NoMatchingBranch {
+        return Err(SelectPackageError::NoMatchingBranch {
             system: request.system,
         });
     }
@@ -65,33 +72,61 @@ fn target_matches_branch(target: &RequestedTarget, branch: PackageBranchRef<'_>)
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-pub enum SelectBuildError {
-    #[snafu(display("no package branch matches requested {system} build target"))]
+pub enum SelectPackageError {
+    #[snafu(display("no package branch matches requested {system} package target"))]
     NoMatchingBranch { system: PackageSystem },
 }
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedInvocation {
-    pub script: PathBuf,
-    pub container: Option<PlannedContainer>,
+pub struct PlannedPackageInvocation {
+    pub executor: PlannedPackageExecutor,
     pub env: BTreeMap<String, String>,
     pub env_mounts: Vec<PlannedEnvMount>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedContainer {
-    pub image: String,
-    pub build: Option<PlannedContainerBuild>,
+impl PlannedPackageInvocation {
+    pub fn uses_container(&self) -> bool {
+        self.executor.uses_container()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedContainerBuild {
-    pub dockerfile: PathBuf,
+pub enum PlannedPackageExecutor {
+    LocalScript {
+        script: PathBuf,
+    },
+    DockerImage {
+        image: String,
+        dockerfile: PathBuf,
+        entrypoint: String,
+    },
+}
+
+impl PlannedPackageExecutor {
+    pub fn script(&self) -> Option<&Path> {
+        match self {
+            Self::LocalScript { script } => Some(script),
+            Self::DockerImage { .. } => None,
+        }
+    }
+
+    pub fn dockerfile(&self) -> Option<&Path> {
+        match self {
+            Self::LocalScript { .. } => None,
+            Self::DockerImage { dockerfile, .. } => Some(dockerfile),
+        }
+    }
+
+    pub fn entrypoint(&self) -> Option<&str> {
+        match self {
+            Self::LocalScript { .. } => None,
+            Self::DockerImage { entrypoint, .. } => Some(entrypoint),
+        }
+    }
+
+    pub fn uses_container(&self) -> bool {
+        matches!(self, Self::DockerImage { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,11 +137,11 @@ pub struct PlannedEnvMount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedPackageBuild {
+pub struct PlannedPackageUnit {
     pub package_id: PackageId,
     pub system: PackageSystem,
     pub target: RequestedTarget,
-    pub invocation: PlannedInvocation,
+    pub invocation: PlannedPackageInvocation,
     pub source_overlay: Option<ContainerOverlayPlan>,
 }
 
@@ -114,7 +149,7 @@ pub fn package_command_invocations(
     contract: &ReleaseContract,
     command: &PackageCommandRequest,
     values: &BTreeMap<String, String>,
-) -> Result<Vec<PlannedPackageBuild>, PackageCommandInvocationsError> {
+) -> Result<Vec<PlannedPackageUnit>, PackageCommandInvocationsError> {
     package_command_invocations_inner(contract, command, values, None)
 }
 
@@ -123,7 +158,7 @@ pub fn package_command_invocations_with_primary_source(
     command: &PackageCommandRequest,
     primary: SiblingSource,
     values: &BTreeMap<String, String>,
-) -> Result<Vec<PlannedPackageBuild>, PackageCommandInvocationsError> {
+) -> Result<Vec<PlannedPackageUnit>, PackageCommandInvocationsError> {
     package_command_invocations_inner(contract, command, values, Some(primary))
 }
 
@@ -132,12 +167,12 @@ fn package_command_invocations_inner(
     command: &PackageCommandRequest,
     values: &BTreeMap<String, String>,
     primary: Option<SiblingSource>,
-) -> Result<Vec<PlannedPackageBuild>, PackageCommandInvocationsError> {
+) -> Result<Vec<PlannedPackageUnit>, PackageCommandInvocationsError> {
     let mut invocations = Vec::new();
     for build in &command.builds {
-        let selected = select_build_branches(
+        let selected = select_package_branches(
             contract,
-            BuildSelectionRequest {
+            PackageSelectionRequest {
                 system: build.system,
                 targets: build.args.targets.clone(),
                 features: build.args.features.clone(),
@@ -164,29 +199,29 @@ fn package_command_invocations_inner(
                 },
             )?,
         };
-        for selected_build in selected {
-            let invocation = build_invocation_for_profile_with_env_values(
+        for selected_package in selected {
+            let invocation = package_invocation_for_profile_with_env_values(
                 contract,
-                selected_build.package_id.as_str(),
-                selected_build.system,
-                selected_build.target.clone(),
+                selected_package.package_id.as_str(),
+                selected_package.system,
+                selected_package.target.clone(),
                 profile,
                 &build.args.features,
                 values,
             )
             .context(package_command_invocations_error::InvocationSnafu {
-                package: selected_build.package_id.clone(),
-                system: selected_build.system,
+                package: selected_package.package_id.clone(),
+                system: selected_package.system,
             })?;
-            let source_overlay = if primary.is_some() && invocation.container.is_none() {
+            let source_overlay = if primary.is_some() && !invocation.uses_container() {
                 None
             } else {
                 section_overlay.clone()
             };
-            invocations.push(PlannedPackageBuild {
-                package_id: selected_build.package_id.clone(),
-                system: selected_build.system,
-                target: selected_build.target,
+            invocations.push(PlannedPackageUnit {
+                package_id: selected_package.package_id.clone(),
+                system: selected_package.system,
+                target: selected_package.target,
                 invocation,
                 source_overlay,
             });
@@ -198,18 +233,18 @@ fn package_command_invocations_inner(
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum PackageCommandInvocationsError {
-    #[snafu(display("failed to select package builds for {system}"))]
+    #[snafu(display("failed to select package units for {system}"))]
     Select {
-        source: SelectBuildError,
+        source: SelectPackageError,
         system: PackageSystem,
     },
-    #[snafu(display("failed to plan {system} build for package {package}"))]
+    #[snafu(display("failed to plan {system} package for package {package}"))]
     Invocation {
         source: PlanInvocationError,
         package: PackageId,
         system: PackageSystem,
     },
-    #[snafu(display("failed to plan source overlay for {system} build"))]
+    #[snafu(display("failed to plan source overlay for {system} package"))]
     Overlay {
         source: crate::cli::PackageSectionOverlayError,
         system: PackageSystem,
@@ -221,7 +256,7 @@ pub struct PlannedS3Publish {
     pub system: PackageSystem,
     pub dry_run: bool,
     pub target: S3PublishTarget,
-    pub invocation: Option<PlannedInvocation>,
+    pub invocation: Option<PlannedPackageInvocation>,
 }
 
 pub fn s3_publish_command_plan(
@@ -233,18 +268,11 @@ pub fn s3_publish_command_plan(
     for system in &command.systems {
         let target = crate::publish::resolve_s3_publish_target(contract, *system, values)
             .context(s3_publish_command_plan_error::TargetSnafu { system: *system })?;
-        let invocation = match system {
-            PackageSystem::Deb | PackageSystem::Rpm => Some(
-                publish_invocation_for(contract, *system)
-                    .context(s3_publish_command_plan_error::InvocationSnafu { system: *system })?,
-            ),
-            PackageSystem::Brew | PackageSystem::Scoop => None,
-        };
         plans.push(PlannedS3Publish {
             system: *system,
             dry_run: command.dry_run,
             target,
-            invocation,
+            invocation: None,
         });
     }
     Ok(plans)
@@ -258,21 +286,16 @@ pub enum S3PublishCommandPlanError {
         source: crate::publish::ResolveS3PublishTargetError,
         system: PackageSystem,
     },
-    #[snafu(display("failed to plan s3 {system} publish invocation"))]
-    Invocation {
-        source: PlanInvocationError,
-        system: PackageSystem,
-    },
 }
 
-pub fn build_invocation_for(
+pub fn package_invocation_for(
     contract: &ReleaseContract,
     package: &str,
     system: PackageSystem,
     target: RequestedTarget,
     features: &[String],
-) -> Result<PlannedInvocation, PlanInvocationError> {
-    build_invocation_for_profile(
+) -> Result<PlannedPackageInvocation, PlanInvocationError> {
+    package_invocation_for_profile(
         contract,
         package,
         system,
@@ -282,14 +305,14 @@ pub fn build_invocation_for(
     )
 }
 
-pub fn build_invocation_for_profile(
+pub fn package_invocation_for_profile(
     contract: &ReleaseContract,
     package: &str,
     system: PackageSystem,
     target: RequestedTarget,
     profile: BuildProfile,
     features: &[String],
-) -> Result<PlannedInvocation, PlanInvocationError> {
+) -> Result<PlannedPackageInvocation, PlanInvocationError> {
     let (package_id, package_contract) =
         contract
             .package_entry(package)
@@ -307,8 +330,8 @@ pub fn build_invocation_for_profile(
         return Err(PlanInvocationError::TargetNotMatched { system });
     }
 
-    let build = branch.build();
     let env = BTreeMap::from([
+        ("XTASK_RELEASE_OPERATION".to_string(), "package".to_string()),
         (
             "XTASK_RELEASE_PACKAGE_ID".to_string(),
             package_id.as_str().to_string(),
@@ -328,58 +351,31 @@ pub fn build_invocation_for_profile(
         ("XTASK_RELEASE_FEATURES".to_string(), features.join(",")),
     ]);
 
-    Ok(PlannedInvocation {
-        script: build.script.clone(),
-        container: planned_build_container(package_id, system, build.container.as_ref())?,
+    Ok(PlannedPackageInvocation {
+        executor: package_executor(package_id, system, branch)?,
         env,
         env_mounts: Vec::new(),
     })
 }
 
-fn planned_build_container(
+fn package_executor(
     package: &PackageId,
     system: PackageSystem,
-    container: Option<&ContainerContract>,
-) -> Result<Option<PlannedContainer>, PlanInvocationError> {
-    planned_container(
-        container,
-        || format!("xtask-release:build-{package}-{system}"),
-        system,
-    )
-}
-
-fn planned_publish_container(
-    system: PackageSystem,
-    container: Option<&ContainerContract>,
-) -> Result<Option<PlannedContainer>, PlanInvocationError> {
-    planned_container(
-        container,
-        || format!("xtask-release:publish-{system}"),
-        system,
-    )
-}
-
-fn planned_container(
-    container: Option<&ContainerContract>,
-    generated_image: impl FnOnce() -> String,
-    system: PackageSystem,
-) -> Result<Option<PlannedContainer>, PlanInvocationError> {
-    let Some(container) = container else {
-        return Ok(None);
-    };
-    match (&container.image, &container.dockerfile) {
-        (Some(image), None) => Ok(Some(PlannedContainer {
-            image: image.clone(),
-            build: None,
-        })),
-        (None, Some(dockerfile)) => Ok(Some(PlannedContainer {
-            image: generated_image(),
-            build: Some(PlannedContainerBuild {
-                dockerfile: dockerfile.clone(),
-            }),
-        })),
-        _ => Err(PlanInvocationError::InvalidContainer { system }),
+    branch: PackageBranchRef<'_>,
+) -> Result<PlannedPackageExecutor, PlanInvocationError> {
+    if let Some(script) = branch.script() {
+        return Ok(PlannedPackageExecutor::LocalScript {
+            script: script.to_path_buf(),
+        });
     }
+    if let Some(dockerfile) = branch.dockerfile() {
+        return Ok(PlannedPackageExecutor::DockerImage {
+            image: format!("xtask-release:package-{package}-{system}"),
+            dockerfile: dockerfile.to_path_buf(),
+            entrypoint: PACKAGE_ENTRYPOINT.to_string(),
+        });
+    }
+    Err(PlanInvocationError::MissingPackageExecutor { system })
 }
 
 fn target_environment_value(target: &RequestedTarget) -> String {
@@ -401,16 +397,14 @@ pub enum PlanInvocationError {
     },
     #[snafu(display("requested target does not match {system} branch"))]
     TargetNotMatched { system: PackageSystem },
-    #[snafu(display("destination s3 {system} branch missing publish script"))]
-    MissingPublish { system: PackageSystem },
+    #[snafu(display("package {system} branch missing package executor"))]
+    MissingPackageExecutor { system: PackageSystem },
     #[snafu(display("missing required build environment variable {name}"))]
     MissingEnv { name: String },
     #[snafu(display("build environment variable {name} must not be empty"))]
     EmptyEnv { name: String },
     #[snafu(display("build env binding {name} must set exactly one of env or value"))]
     InvalidEnvBinding { name: String },
-    #[snafu(display("container for {system} must set exactly one of image or dockerfile"))]
-    InvalidContainer { system: PackageSystem },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -447,8 +441,8 @@ pub fn build_env_names(
         insert_env_binding_name(name, binding, &mut names)?;
     }
 
-    if let Some(target_build) = branch.build().target.get(target_key(&target)) {
-        for (name, binding) in &target_build.env {
+    if let Some(target_env) = branch.target_env(target_key(&target)) {
+        for (name, binding) in target_env {
             if let Some(package_binding) = package_contract.build.env.get(name) {
                 remove_env_binding_name(package_binding, &mut names);
             }
@@ -517,44 +511,15 @@ fn remove_env_binding_name(binding: &crate::contract::EnvBinding, names: &mut Bu
     }
 }
 
-pub fn publish_invocation_for(
-    contract: &ReleaseContract,
-    system: PackageSystem,
-) -> Result<PlannedInvocation, PlanInvocationError> {
-    let publish = match system {
-        PackageSystem::Deb => contract
-            .destination
-            .s3
-            .deb
-            .as_ref()
-            .and_then(|destination| destination.publish.as_ref()),
-        PackageSystem::Rpm => contract
-            .destination
-            .s3
-            .rpm
-            .as_ref()
-            .and_then(|destination| destination.publish.as_ref()),
-        PackageSystem::Brew | PackageSystem::Scoop => None,
-    }
-    .ok_or(PlanInvocationError::MissingPublish { system })?;
-
-    Ok(PlannedInvocation {
-        script: publish.script.clone(),
-        container: planned_publish_container(system, publish.container.as_ref())?,
-        env: BTreeMap::new(),
-        env_mounts: Vec::new(),
-    })
-}
-
-pub fn build_invocation_with_env_values(
+pub fn package_invocation_with_env_values(
     contract: &ReleaseContract,
     package: &str,
     system: PackageSystem,
     target: RequestedTarget,
     features: &[String],
     values: &BTreeMap<String, String>,
-) -> Result<PlannedInvocation, PlanInvocationError> {
-    build_invocation_for_profile_with_env_values(
+) -> Result<PlannedPackageInvocation, PlanInvocationError> {
+    package_invocation_for_profile_with_env_values(
         contract,
         package,
         system,
@@ -565,7 +530,7 @@ pub fn build_invocation_with_env_values(
     )
 }
 
-pub fn build_invocation_for_profile_with_env_values(
+pub fn package_invocation_for_profile_with_env_values(
     contract: &ReleaseContract,
     package: &str,
     system: PackageSystem,
@@ -573,7 +538,7 @@ pub fn build_invocation_for_profile_with_env_values(
     profile: BuildProfile,
     features: &[String],
     values: &BTreeMap<String, String>,
-) -> Result<PlannedInvocation, PlanInvocationError> {
+) -> Result<PlannedPackageInvocation, PlanInvocationError> {
     let (_, package_contract) =
         contract
             .package_entry(package)
@@ -591,23 +556,27 @@ pub fn build_invocation_for_profile_with_env_values(
         return Err(PlanInvocationError::TargetNotMatched { system });
     }
 
-    let mut plan =
-        build_invocation_for_profile(contract, package, system, target.clone(), profile, features)?;
+    let mut plan = package_invocation_for_profile(
+        contract,
+        package,
+        system,
+        target.clone(),
+        profile,
+        features,
+    )?;
     let mut bindings = package_contract
         .build
         .env
         .iter()
         .map(|(name, binding)| (name.as_str(), binding))
         .collect::<BTreeMap<_, _>>();
-    if let Some(target_build) = branch.build().target.get(target_key(&target)) {
-        for (name, binding) in &target_build.env {
+    if let Some(target_env) = branch.target_env(target_key(&target)) {
+        for (name, binding) in target_env {
             bindings.insert(name.as_str(), binding);
         }
     }
     for (name, binding) in bindings {
-        if let Some(resolved) =
-            resolve_env_binding(name, binding, values, plan.container.is_some())?
-        {
+        if let Some(resolved) = resolve_env_binding(name, binding, values, plan.uses_container())? {
             plan.env.insert(name.to_string(), resolved.value);
             if let Some(mount) = resolved.mount {
                 plan.env_mounts.push(mount);
