@@ -1,0 +1,819 @@
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+use semver::Version;
+use serde::Deserialize;
+use snafu::{ResultExt, Snafu};
+
+use crate::{
+    package::PackageId,
+    system::{ArchitectureClass, PackageSystem},
+};
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct ReleaseContract {
+    pub package: BTreeMap<PackageId, PackageContract>,
+    pub destination: DestinationContract,
+}
+
+impl ReleaseContract {
+    pub fn validate(&self) -> Result<(), ValidateContractError> {
+        for (id, package) in &self.package {
+            package.validate(id)?;
+        }
+        for (id, package) in &self.package {
+            for branch in package.branches() {
+                validate_branch_requires(self, id, branch)?;
+            }
+        }
+        validate_destination_env_refs(self)?;
+        validate_destination_branches(self)?;
+        Ok(())
+    }
+
+    pub fn package(&self, id: &str) -> Option<&PackageContract> {
+        self.package
+            .iter()
+            .find(|(package_id, _)| package_id.as_str() == id)
+            .map(|(_, package)| package)
+    }
+
+    pub fn package_entry(&self, id: &str) -> Option<(&PackageId, &PackageContract)> {
+        self.package
+            .iter()
+            .find(|(package_id, _)| package_id.as_str() == id)
+    }
+}
+
+pub fn load_release_contract(path: &Path) -> Result<ReleaseContract, LoadReleaseContractError> {
+    let input = fs::read_to_string(path).context(load_release_contract_error::ReadSnafu {
+        path: path.to_path_buf(),
+    })?;
+    let contract: ReleaseContract =
+        toml::from_str(&input).context(load_release_contract_error::ParseSnafu {
+            path: path.to_path_buf(),
+        })?;
+    contract
+        .validate()
+        .context(load_release_contract_error::InvalidSnafu)?;
+    Ok(contract)
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct PackageContract {
+    pub manifest: Option<PathBuf>,
+    pub version: Option<String>,
+    pub description: Option<String>,
+    pub license: Option<String>,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub build: PackageBuildContract,
+    pub deb: Option<DebBranch>,
+    pub rpm: Option<RpmBranch>,
+    pub brew: Option<BrewBranch>,
+    pub scoop: Option<ScoopBranch>,
+}
+
+impl PackageContract {
+    pub fn validate(&self, id: &PackageId) -> Result<(), ValidateContractError> {
+        match (&self.manifest, &self.version) {
+            (Some(_), Some(_)) => {
+                return Err(ValidateContractError::ManifestAndVersion {
+                    package: id.clone(),
+                });
+            }
+            (None, None) => {
+                return Err(ValidateContractError::MissingVersion {
+                    package: id.clone(),
+                });
+            }
+            (Some(_), None) => {}
+            (None, Some(version)) => {
+                validate_source_version(id, version)?;
+                require_non_cargo_metadata(id, "description", &self.description)?;
+                require_non_cargo_metadata(id, "license", &self.license)?;
+                require_non_cargo_metadata(id, "homepage", &self.homepage)?;
+            }
+        }
+
+        validate_env_bindings(id, None, &self.build.env)?;
+        for branch in self.branches() {
+            branch.validate(id)?;
+        }
+        Ok(())
+    }
+
+    pub fn branch(&self, system: PackageSystem) -> Option<PackageBranchRef<'_>> {
+        match system {
+            PackageSystem::Deb => self.deb.as_ref().map(PackageBranchRef::Deb),
+            PackageSystem::Rpm => self.rpm.as_ref().map(PackageBranchRef::Rpm),
+            PackageSystem::Brew => self.brew.as_ref().map(PackageBranchRef::Brew),
+            PackageSystem::Scoop => self.scoop.as_ref().map(PackageBranchRef::Scoop),
+        }
+    }
+
+    pub fn branches(&self) -> impl Iterator<Item = PackageBranchRef<'_>> {
+        [
+            self.branch(PackageSystem::Deb),
+            self.branch(PackageSystem::Rpm),
+            self.branch(PackageSystem::Brew),
+            self.branch(PackageSystem::Scoop),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+fn validate_source_version(id: &PackageId, version: &str) -> Result<(), ValidateContractError> {
+    if version.contains('-') {
+        return Err(ValidateContractError::PackageSystemVersionAtRoot {
+            package: id.clone(),
+            version: version.to_owned(),
+        });
+    }
+    Version::parse(version).context(validate_contract_error::InvalidSourceVersionSnafu {
+        package: id.clone(),
+        version: version.to_owned(),
+    })?;
+    Ok(())
+}
+
+fn validate_env_bindings(
+    id: &PackageId,
+    system: Option<PackageSystem>,
+    bindings: &BTreeMap<String, EnvBinding>,
+) -> Result<(), ValidateContractError> {
+    for (name, binding) in bindings {
+        match (&binding.env, &binding.value) {
+            (Some(env), None) => {
+                if env.is_empty() {
+                    return Err(ValidateContractError::EmptyEnvBinding {
+                        package: id.clone(),
+                        system,
+                        name: name.clone(),
+                    });
+                }
+                if binding
+                    .container_path
+                    .as_ref()
+                    .is_some_and(|path| path.as_os_str().is_empty())
+                {
+                    return Err(ValidateContractError::EmptyContainerPath {
+                        package: id.clone(),
+                        system,
+                        name: name.clone(),
+                    });
+                }
+            }
+            (None, Some(value)) => {
+                if binding.container_path.is_some() {
+                    return Err(ValidateContractError::ContainerPathValueBinding {
+                        package: id.clone(),
+                        system,
+                        name: name.clone(),
+                    });
+                }
+                if binding.optional {
+                    return Err(ValidateContractError::OptionalValueBinding {
+                        package: id.clone(),
+                        system,
+                        name: name.clone(),
+                    });
+                }
+                if value.is_empty() {
+                    return Err(ValidateContractError::EmptyEnvBinding {
+                        package: id.clone(),
+                        system,
+                        name: name.clone(),
+                    });
+                }
+            }
+            _ => {
+                return Err(ValidateContractError::InvalidEnvBinding {
+                    package: id.clone(),
+                    system,
+                    name: name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_destination_env_refs(contract: &ReleaseContract) -> Result<(), ValidateContractError> {
+    validate_env_ref("endpoint", &contract.destination.s3.endpoint)?;
+    validate_env_ref("access key id", &contract.destination.s3.access_key_id)?;
+    validate_env_ref(
+        "secret access key",
+        &contract.destination.s3.secret_access_key,
+    )?;
+    if let Some(branch) = &contract.destination.s3.brew {
+        validate_env_ref("brew tap token", &branch.tap.token)?;
+    }
+    if let Some(branch) = &contract.destination.s3.deb {
+        validate_env_ref("deb signing key", &branch.signing.key)?;
+        validate_env_ref("deb signing passphrase", &branch.signing.passphrase)?;
+        if let Some(fingerprint) = &branch.fingerprint {
+            validate_env_ref("deb signing fingerprint", fingerprint)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_env_ref(field: &'static str, ref_: &EnvRef) -> Result<(), ValidateContractError> {
+    if ref_.env.is_empty() {
+        return Err(ValidateContractError::EmptyEnvRef { field });
+    }
+    Ok(())
+}
+
+fn require_non_cargo_metadata(
+    id: &PackageId,
+    field: &'static str,
+    value: &Option<String>,
+) -> Result<(), ValidateContractError> {
+    if value.as_deref().is_none_or(str::is_empty) {
+        return Err(ValidateContractError::MissingPackageMetadata {
+            package: id.clone(),
+            field,
+        });
+    }
+    Ok(())
+}
+
+fn validate_branch_requires(
+    contract: &ReleaseContract,
+    id: &PackageId,
+    branch: PackageBranchRef<'_>,
+) -> Result<(), ValidateContractError> {
+    let system = branch.system();
+    for (dependency, _) in branch.requires().iter() {
+        let Some(dependency_package) = contract.package.get(dependency) else {
+            return Err(ValidateContractError::MissingRequiredPackage {
+                package: id.clone(),
+                system,
+                dependency: dependency.clone(),
+            });
+        };
+        if dependency_package.branch(system).is_none() {
+            return Err(ValidateContractError::MissingRequiredPackageBranch {
+                package: id.clone(),
+                system,
+                dependency: dependency.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_destination_branches(contract: &ReleaseContract) -> Result<(), ValidateContractError> {
+    validate_destination_branch(
+        contract,
+        PackageSystem::Deb,
+        contract.destination.s3.deb.is_some(),
+    )?;
+    validate_destination_branch(
+        contract,
+        PackageSystem::Rpm,
+        contract.destination.s3.rpm.is_some(),
+    )?;
+    validate_destination_branch(
+        contract,
+        PackageSystem::Brew,
+        contract.destination.s3.brew.is_some(),
+    )?;
+    validate_destination_branch(
+        contract,
+        PackageSystem::Scoop,
+        contract.destination.s3.scoop.is_some(),
+    )?;
+    validate_destination_publish(contract)?;
+    Ok(())
+}
+
+fn validate_destination_branch(
+    contract: &ReleaseContract,
+    system: PackageSystem,
+    defined: bool,
+) -> Result<(), ValidateContractError> {
+    if !defined {
+        return Ok(());
+    }
+    if contract
+        .package
+        .values()
+        .any(|package| package.branch(system).is_some())
+    {
+        return Ok(());
+    }
+    Err(ValidateContractError::DestinationWithoutPackageBranch { system })
+}
+
+fn validate_destination_publish(contract: &ReleaseContract) -> Result<(), ValidateContractError> {
+    if let Some(branch) = &contract.destination.s3.deb {
+        validate_publish_contract(PackageSystem::Deb, branch.publish.as_ref())?;
+    }
+    if let Some(branch) = &contract.destination.s3.rpm {
+        validate_publish_contract(PackageSystem::Rpm, branch.publish.as_ref())?;
+    }
+    Ok(())
+}
+
+fn validate_publish_contract(
+    system: PackageSystem,
+    publish: Option<&PublishContract>,
+) -> Result<(), ValidateContractError> {
+    let Some(publish) = publish else {
+        return Err(ValidateContractError::MissingPublish { system });
+    };
+    if publish.script.as_os_str().is_empty() {
+        return Err(ValidateContractError::MissingPublish { system });
+    }
+    validate_publish_container(system, publish.container.as_ref())?;
+    Ok(())
+}
+
+fn validate_build_container(
+    package: &PackageId,
+    system: PackageSystem,
+    container: Option<&ContainerContract>,
+) -> Result<(), ValidateContractError> {
+    let Some(container) = container else {
+        return Ok(());
+    };
+    match (&container.image, &container.dockerfile) {
+        (Some(image), None) => {
+            if image.is_empty() {
+                return Err(ValidateContractError::EmptyBuildContainerImage {
+                    package: package.clone(),
+                    system,
+                });
+            }
+        }
+        (None, Some(dockerfile)) => {
+            if dockerfile.as_os_str().is_empty() {
+                return Err(ValidateContractError::EmptyBuildContainerDockerfile {
+                    package: package.clone(),
+                    system,
+                });
+            }
+        }
+        _ => {
+            return Err(ValidateContractError::InvalidBuildContainer {
+                package: package.clone(),
+                system,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_publish_container(
+    system: PackageSystem,
+    container: Option<&ContainerContract>,
+) -> Result<(), ValidateContractError> {
+    let Some(container) = container else {
+        return Ok(());
+    };
+    match (&container.image, &container.dockerfile) {
+        (Some(image), None) => {
+            if image.is_empty() {
+                return Err(ValidateContractError::EmptyPublishContainerImage { system });
+            }
+        }
+        (None, Some(dockerfile)) => {
+            if dockerfile.as_os_str().is_empty() {
+                return Err(ValidateContractError::EmptyPublishContainerDockerfile { system });
+            }
+        }
+        _ => return Err(ValidateContractError::InvalidPublishContainer { system }),
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct PackageBuildContract {
+    #[serde(default)]
+    pub env: BTreeMap<String, EnvBinding>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct EnvBinding {
+    pub env: Option<String>,
+    pub value: Option<String>,
+    pub container_path: Option<PathBuf>,
+    #[serde(default)]
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct DebBranch {
+    pub revision: String,
+    pub architecture: ArchitectureClass,
+    #[serde(default)]
+    pub requires: RequiresContract,
+    pub build: BuildContract,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct RpmBranch {
+    pub release: String,
+    pub architecture: ArchitectureClass,
+    #[serde(default)]
+    pub requires: RequiresContract,
+    pub build: BuildContract,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct BrewBranch {
+    pub template: Option<PathBuf>,
+    #[serde(default)]
+    pub requires: RequiresContract,
+    pub build: BuildContract,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct ScoopBranch {
+    pub template: Option<PathBuf>,
+    pub bin: Vec<String>,
+    #[serde(default)]
+    pub requires: RequiresContract,
+    pub build: BuildContract,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct RequiresContract(pub BTreeMap<PackageId, RequiredPackageContract>);
+
+impl RequiresContract {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, package: &str) -> Option<&RequiredPackageContract> {
+        self.0
+            .iter()
+            .find(|(id, _)| id.as_str() == package)
+            .map(|(_, contract)| contract)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&PackageId, &RequiredPackageContract)> {
+        self.0.iter()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct RequiredPackageContract {
+    pub version: VersionBoundContract,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct VersionBoundContract {
+    #[serde(rename = ">=")]
+    pub minimum: Option<VersionBoundSourceContract>,
+    #[serde(rename = "<=")]
+    pub maximum: Option<VersionBoundSourceContract>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct VersionBoundSourceContract {
+    pub from: VersionBoundSource,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionBoundSource {
+    #[serde(rename = "self")]
+    SelfPackage,
+    #[serde(rename = "dependency")]
+    DependencyPackage,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct BuildContract {
+    pub script: PathBuf,
+    pub container: Option<ContainerContract>,
+    #[serde(default)]
+    pub target: BTreeMap<String, TargetBuildContract>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct ContainerContract {
+    pub image: Option<String>,
+    pub dockerfile: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct TargetBuildContract {
+    #[serde(default)]
+    pub env: BTreeMap<String, EnvBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageBranchRef<'a> {
+    Deb(&'a DebBranch),
+    Rpm(&'a RpmBranch),
+    Brew(&'a BrewBranch),
+    Scoop(&'a ScoopBranch),
+}
+
+impl<'a> PackageBranchRef<'a> {
+    pub fn system(self) -> PackageSystem {
+        match self {
+            Self::Deb(_) => PackageSystem::Deb,
+            Self::Rpm(_) => PackageSystem::Rpm,
+            Self::Brew(_) => PackageSystem::Brew,
+            Self::Scoop(_) => PackageSystem::Scoop,
+        }
+    }
+
+    pub fn requires(self) -> &'a RequiresContract {
+        match self {
+            Self::Deb(branch) => &branch.requires,
+            Self::Rpm(branch) => &branch.requires,
+            Self::Brew(branch) => &branch.requires,
+            Self::Scoop(branch) => &branch.requires,
+        }
+    }
+
+    pub fn build(self) -> &'a BuildContract {
+        match self {
+            Self::Deb(branch) => &branch.build,
+            Self::Rpm(branch) => &branch.build,
+            Self::Brew(branch) => &branch.build,
+            Self::Scoop(branch) => &branch.build,
+        }
+    }
+
+    pub fn architecture(self) -> Option<ArchitectureClass> {
+        match self {
+            Self::Deb(branch) => Some(branch.architecture),
+            Self::Rpm(branch) => Some(branch.architecture),
+            Self::Brew(_) | Self::Scoop(_) => None,
+        }
+    }
+
+    pub fn validate(self, id: &PackageId) -> Result<(), ValidateContractError> {
+        if self.build().script.as_os_str().is_empty() {
+            return Err(ValidateContractError::MissingBuildScript {
+                package: id.clone(),
+                system: self.system(),
+            });
+        }
+        validate_build_container(id, self.system(), self.build().container.as_ref())?;
+        if let Self::Scoop(branch) = self
+            && branch.bin.is_empty()
+        {
+            return Err(ValidateContractError::MissingScoopBin {
+                package: id.clone(),
+            });
+        }
+        for target in self.build().target.values() {
+            validate_env_bindings(id, Some(self.system()), &target.env)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct DestinationContract {
+    pub s3: S3DestinationContract,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3DestinationContract {
+    pub bucket: String,
+    pub endpoint: EnvRef,
+    pub access_key_id: EnvRef,
+    pub secret_access_key: EnvRef,
+    pub brew: Option<S3BrewDestination>,
+    pub scoop: Option<S3ScoopDestination>,
+    pub deb: Option<S3DebDestination>,
+    pub rpm: Option<S3RpmDestination>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct EnvRef {
+    pub env: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3BrewDestination {
+    pub prefix: String,
+    pub public_base_url: String,
+    pub tap: TapDestination,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3ScoopDestination {
+    pub prefix: String,
+    pub public_base_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct TapDestination {
+    pub repository: String,
+    pub base_branch: String,
+    pub token: EnvRef,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3DebDestination {
+    pub prefix: String,
+    pub suite: String,
+    pub signing: DebSigning,
+    pub fingerprint: Option<EnvRef>,
+    pub publish: Option<PublishContract>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct DebSigning {
+    pub key: EnvRef,
+    pub passphrase: EnvRef,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3RpmDestination {
+    pub prefix: String,
+    pub publish: Option<PublishContract>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct PublishContract {
+    pub script: PathBuf,
+    pub container: Option<ContainerContract>,
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ValidateContractError {
+    #[snafu(display("package {package} must not define both manifest and version"))]
+    ManifestAndVersion { package: PackageId },
+    #[snafu(display("package {package} must define manifest or version"))]
+    MissingVersion { package: PackageId },
+    #[snafu(display("package {package} root version {version} must be a source version"))]
+    PackageSystemVersionAtRoot { package: PackageId, version: String },
+    #[snafu(display("package {package} has invalid source version {version}"))]
+    InvalidSourceVersion {
+        source: semver::Error,
+        package: PackageId,
+        version: String,
+    },
+    #[snafu(display("package {package} missing metadata field {field}"))]
+    MissingPackageMetadata {
+        package: PackageId,
+        field: &'static str,
+    },
+    #[snafu(display("package {package} {system} branch missing build script"))]
+    MissingBuildScript {
+        package: PackageId,
+        system: PackageSystem,
+    },
+    #[snafu(display("package {package} scoop branch requires at least one bin entry"))]
+    MissingScoopBin { package: PackageId },
+    #[snafu(display("package {package} {system} branch requires missing package {dependency}"))]
+    MissingRequiredPackage {
+        package: PackageId,
+        system: PackageSystem,
+        dependency: PackageId,
+    },
+    #[snafu(display(
+        "package {package} {system} branch requires package {dependency} without {system} branch"
+    ))]
+    MissingRequiredPackageBranch {
+        package: PackageId,
+        system: PackageSystem,
+        dependency: PackageId,
+    },
+    #[snafu(display("destination s3 {system} branch has no package {system} branch"))]
+    DestinationWithoutPackageBranch { system: PackageSystem },
+    #[snafu(display("destination s3 {system} branch missing publish script"))]
+    MissingPublish { system: PackageSystem },
+    #[snafu(display(
+        "package {package} {system} branch container must set exactly one of image or dockerfile"
+    ))]
+    InvalidBuildContainer {
+        package: PackageId,
+        system: PackageSystem,
+    },
+    #[snafu(display("package {package} {system} branch container image must not be empty"))]
+    EmptyBuildContainerImage {
+        package: PackageId,
+        system: PackageSystem,
+    },
+    #[snafu(display("package {package} {system} branch container dockerfile must not be empty"))]
+    EmptyBuildContainerDockerfile {
+        package: PackageId,
+        system: PackageSystem,
+    },
+    #[snafu(display(
+        "destination s3 {system} publish container must set exactly one of image or dockerfile"
+    ))]
+    InvalidPublishContainer { system: PackageSystem },
+    #[snafu(display("destination s3 {system} publish container image must not be empty"))]
+    EmptyPublishContainerImage { system: PackageSystem },
+    #[snafu(display("destination s3 {system} publish container dockerfile must not be empty"))]
+    EmptyPublishContainerDockerfile { system: PackageSystem },
+    #[snafu(display("package {package} env binding {name} must set exactly one of env or value"))]
+    InvalidEnvBinding {
+        package: PackageId,
+        system: Option<PackageSystem>,
+        name: String,
+    },
+    #[snafu(display("package {package} env binding {name} must not be empty"))]
+    EmptyEnvBinding {
+        package: PackageId,
+        system: Option<PackageSystem>,
+        name: String,
+    },
+    #[snafu(display("package {package} env binding {name} optional requires env"))]
+    OptionalValueBinding {
+        package: PackageId,
+        system: Option<PackageSystem>,
+        name: String,
+    },
+    #[snafu(display("package {package} env binding {name} container path requires env"))]
+    ContainerPathValueBinding {
+        package: PackageId,
+        system: Option<PackageSystem>,
+        name: String,
+    },
+    #[snafu(display("package {package} env binding {name} container path must not be empty"))]
+    EmptyContainerPath {
+        package: PackageId,
+        system: Option<PackageSystem>,
+        name: String,
+    },
+    #[snafu(display("destination s3 {field} env ref must not be empty"))]
+    EmptyEnvRef { field: &'static str },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum LoadReleaseContractError {
+    #[snafu(display("failed to read release contract"))]
+    Read {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+    #[snafu(display("failed to parse release contract"))]
+    Parse {
+        source: toml::de::Error,
+        path: PathBuf,
+    },
+    #[snafu(display("invalid release contract"))]
+    Invalid { source: ValidateContractError },
+}

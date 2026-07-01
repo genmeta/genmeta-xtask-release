@@ -1,0 +1,127 @@
+[package.pishoo]
+manifest = "pishoo/Cargo.toml"
+
+[package.pishoo.build.env.DHTTP_ROOT_CA]
+env = "DHTTP_ROOT_CA"
+container_path = "/dhttp-bootstrap/root.crt"
+
+[package.pishoo.build.env.DHTTP_STUN_SERVER]
+env = "DHTTP_STUN_SERVER"
+
+[package.pishoo.build.env.DHTTP_H3_DNS_SERVER]
+env = "DHTTP_H3_DNS_SERVER"
+
+[package.pishoo.build.env.DHTTP_HTTP_DNS_SERVER]
+env = "DHTTP_HTTP_DNS_SERVER"
+
+[package.pishoo.build.env.DHTTP_MDNS_SERVICE]
+env = "DHTTP_MDNS_SERVICE"
+
+[package.pishoo.build.env.DHTTP_CERT_SERVER_URL]
+env = "DHTTP_CERT_SERVER_URL"
+
+[package.pishoo.build.env.DHTTP_GLOBAL_HOME]
+env = "DHTTP_GLOBAL_HOME"
+optional = true
+
+[package.pishoo.deb]
+revision = "1"
+architecture = "target"
+
+[package.pishoo.deb.requires.pishoo-common.version]
+">=" = { from = "dependency" }
+"<=" = { from = "self" }
+
+[package.pishoo.deb.build]
+script = "xtask/release/deb/pishoo.sh"
+
+[package.pishoo.deb.build.container]
+dockerfile = "xtask/release/deb/Dockerfile"
+
+[package.pishoo.rpm]
+release = "1"
+architecture = "target"
+
+[package.pishoo.rpm.requires.pishoo-common.version]
+">=" = { from = "dependency" }
+"<=" = { from = "self" }
+
+[package.pishoo.rpm.build]
+script = "xtask/release/rpm/pishoo.sh"
+
+[package.pishoo.rpm.build.container]
+dockerfile = "xtask/release/rpm/Dockerfile"
+
+[package.pishoo.brew]
+template = "xtask/templates/pishoo.rb.in"
+
+[package.pishoo.brew.build]
+script = "xtask/release/brew/pishoo.sh"
+
+[package.pishoo.brew.build.target.aarch64-apple-darwin.env.DHTTP_GLOBAL_HOME]
+value = "/opt/homebrew/etc/dhttp"
+
+[package.pishoo.brew.build.target.x86_64-apple-darwin.env.DHTTP_GLOBAL_HOME]
+value = "/usr/local/etc/dhttp"
+
+[package.pishoo-common]
+version = "0.5.1"
+description = "Common files for pishoo"
+license = "Apache-2.0"
+homepage = "https://dhttp.net"
+repository = "https://github.com/genmeta/gateway"
+
+[package.pishoo-common.deb]
+revision = "1"
+architecture = "all"
+
+[package.pishoo-common.deb.build]
+script = "xtask/release/deb/pishoo-common.sh"
+
+[package.pishoo-common.deb.build.container]
+dockerfile = "xtask/release/deb/Dockerfile"
+
+[package.pishoo-common.rpm]
+release = "1"
+architecture = "noarch"
+
+[package.pishoo-common.rpm.build]
+script = "xtask/release/rpm/pishoo-common.sh"
+
+[package.pishoo-common.rpm.build.container]
+dockerfile = "xtask/release/rpm/Dockerfile"
+
+[destination.s3]
+bucket = "download"
+endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
+access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
+secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
+
+[destination.s3.brew]
+prefix = "homebrew"
+public_base_url = "https://download.dhttp.net/homebrew"
+tap.repository = "genmeta/homebrew-genmeta"
+tap.base_branch = "main"
+tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+[destination.s3.deb]
+prefix = "ppa/genmeta"
+suite = "genmeta"
+signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
+signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
+fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
+
+[destination.s3.deb.publish]
+script = "xtask/release/publish/deb.sh"
+
+[destination.s3.deb.publish.container]
+dockerfile = "xtask/release/publish/deb/Dockerfile"
+
+[destination.s3.rpm]
+prefix = "rpm/pishoo"
+
+[destination.s3.rpm.publish]
+script = "xtask/release/publish/rpm.sh"
+
+[destination.s3.rpm.publish.container]
+dockerfile = "xtask/release/publish/rpm/Dockerfile"
