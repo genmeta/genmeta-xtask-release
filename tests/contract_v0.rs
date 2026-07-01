@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, str::FromStr};
 
 use sha2::Digest;
 
@@ -1193,6 +1193,36 @@ fn explicit_package_metadata_resolves_non_cargo_package() {
         metadata.repository.as_deref(),
         Some("https://github.com/genmeta/gateway")
     );
+}
+
+#[test]
+fn linux_package_version_encodes_semver_prerelease_with_tilde() {
+    let beta = semver::Version::parse("1.2.3-beta.1").expect("semver should parse");
+    let stable = semver::Version::parse("1.2.3").expect("semver should parse");
+
+    let deb_beta = genmeta_xtask_release::package::PackageVersion::deb(beta.clone(), "1")
+        .expect("deb version should resolve")
+        .as_string();
+    let deb_stable = genmeta_xtask_release::package::PackageVersion::deb(stable.clone(), "1")
+        .expect("deb version should resolve")
+        .as_string();
+    let rpm_beta = genmeta_xtask_release::package::PackageVersion::rpm(beta, "1")
+        .expect("rpm version should resolve")
+        .as_string();
+    let rpm_stable = genmeta_xtask_release::package::PackageVersion::rpm(stable, "1")
+        .expect("rpm version should resolve")
+        .as_string();
+
+    assert_eq!(deb_beta, "1.2.3~beta.1-1");
+    assert_eq!(rpm_beta, "1.2.3~beta.1-1");
+
+    let deb_beta = debversion::Version::from_str(&deb_beta).expect("deb beta should parse");
+    let deb_stable = debversion::Version::from_str(&deb_stable).expect("deb stable should parse");
+    assert!(deb_beta < deb_stable);
+
+    let rpm_beta = rpm_version::Evr::parse(&rpm_beta);
+    let rpm_stable = rpm_version::Evr::parse(&rpm_stable);
+    assert!(rpm_beta < rpm_stable);
 }
 
 #[test]
@@ -2853,7 +2883,7 @@ fn publishable_deb_payloads_from_manifest_and_packages_selects_candidates_once()
 }
 
 #[test]
-fn retained_remote_linux_package_payloads_exclude_local_manifest_versions() {
+fn retained_remote_linux_package_payloads_keep_all_remote_versions() {
     let manifest = linux_manifest(
         PackageSystem::Rpm,
         vec![
@@ -2878,13 +2908,15 @@ fn retained_remote_linux_package_payloads_exclude_local_manifest_versions() {
         retained,
         vec![
             linux_payload("sample", "1.2.3-1", "x86_64"),
+            linux_payload("sample", "1.2.4-1", "x86_64"),
+            linux_payload("sample", "1.2.4-1", "aarch64"),
             linux_payload("sample-common", "1.2.4-1", "noarch"),
         ]
     );
 }
 
 #[test]
-fn retained_remote_deb_package_entries_exclude_local_manifest_versions() {
+fn retained_remote_deb_package_entries_keep_all_remote_versions() {
     let manifest = linux_manifest(
         PackageSystem::Deb,
         vec![
@@ -2909,6 +2941,8 @@ fn retained_remote_deb_package_entries_exclude_local_manifest_versions() {
         retained,
         vec![
             remote_deb_entry("sample", "1.2.3-1", "amd64"),
+            remote_deb_entry("sample", "1.2.4-1", "amd64"),
+            remote_deb_entry("sample", "1.2.4-1", "arm64"),
             remote_deb_entry("sample-common", "1.2.4-1", "all"),
         ]
     );

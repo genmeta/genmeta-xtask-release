@@ -99,8 +99,10 @@ impl PackageVersion {
 
     pub fn as_string(&self) -> String {
         match self {
-            Self::Deb { source, revision } => format!("{source}-{revision}"),
-            Self::Rpm { source, release } => format!("{source}-{release}"),
+            Self::Deb { source, revision } => {
+                format!("{}-{revision}", linux_source_version(source))
+            }
+            Self::Rpm { source, release } => format!("{}-{release}", linux_source_version(source)),
             Self::Plain { source } => source.to_string(),
         }
     }
@@ -118,6 +120,19 @@ fn ensure_segment(value: &str, name: &'static str) -> Result<(), PackageVersionE
         return Err(PackageVersionError::EmptySegment { name });
     }
     Ok(())
+}
+
+fn linux_source_version(source: &Version) -> String {
+    let mut version = format!("{}.{}.{}", source.major, source.minor, source.patch);
+    if !source.pre.is_empty() {
+        version.push('~');
+        version.push_str(source.pre.as_str());
+    }
+    if !source.build.is_empty() {
+        version.push('+');
+        version.push_str(source.build.as_str());
+    }
+    version
 }
 
 use std::path::{Path, PathBuf};

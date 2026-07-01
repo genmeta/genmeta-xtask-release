@@ -567,19 +567,9 @@ pub fn retained_remote_linux_package_payloads(
     manifest: &PackageManifest,
     remote_payloads: Vec<LinuxPackagePayload>,
 ) -> Result<Vec<LinuxPackagePayload>, RetainedRemoteLinuxPackagePayloadsError> {
-    let local_versions = local_linux_package_versions(manifest)
+    linux_package_payloads_from_manifest(manifest)
         .context(retained_remote_linux_package_payloads_error::LocalPayloadsSnafu)?;
-
-    Ok(remote_payloads
-        .into_iter()
-        .filter(|payload| {
-            !local_versions.contains(&(
-                payload.package.clone(),
-                payload.version.clone(),
-                payload.architecture.clone(),
-            ))
-        })
-        .collect())
+    Ok(remote_payloads)
 }
 
 #[derive(Debug, Snafu)]
@@ -589,15 +579,6 @@ pub enum RetainedRemoteLinuxPackagePayloadsError {
     LocalPayloads {
         source: LinuxPackagePayloadsFromManifestError,
     },
-}
-
-fn local_linux_package_versions(
-    manifest: &PackageManifest,
-) -> Result<BTreeSet<(String, String, String)>, LinuxPackagePayloadsFromManifestError> {
-    Ok(linux_package_payloads_from_manifest(manifest)?
-        .into_iter()
-        .map(|payload| (payload.package, payload.version, payload.architecture))
-        .collect())
 }
 
 pub fn retained_remote_deb_package_entries(
@@ -610,19 +591,9 @@ pub fn retained_remote_deb_package_entries(
             system: manifest.kind
         }
     );
-    let local_versions = local_linux_package_versions(manifest)
+    linux_package_payloads_from_manifest(manifest)
         .context(retained_remote_deb_package_entries_error::LocalPayloadsSnafu)?;
-
-    Ok(remote_entries
-        .into_iter()
-        .filter(|entry| {
-            !local_versions.contains(&(
-                entry.version.package.clone(),
-                entry.version.version.clone(),
-                entry.version.architecture.clone(),
-            ))
-        })
-        .collect())
+    Ok(remote_entries)
 }
 
 #[derive(Debug, Snafu)]
