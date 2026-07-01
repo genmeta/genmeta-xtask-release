@@ -35,7 +35,6 @@ pub struct ContainerMount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerOverlayPlan {
     pub mounts: Vec<ContainerMount>,
-    pub cargo_config_path: PathBuf,
     pub cargo_config: String,
 }
 
@@ -64,7 +63,6 @@ pub fn container_overlay_plan(
                 read_only: true,
             })
             .collect(),
-        cargo_config_path: PathBuf::from("/opt/cargo/config.toml"),
         cargo_config: render_cargo_patch_config(overrides),
     })
 }

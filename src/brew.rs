@@ -41,8 +41,34 @@ pub fn brew_template_variables(
         "brew.urls".to_string(),
         formula_urls(manifest, public_base_url)?,
     );
+    variables.insert(
+        "homebrew.class".to_string(),
+        formula_class_name(package_id.as_str()),
+    );
+    variables.insert(
+        "homebrew.urls".to_string(),
+        formula_urls(manifest, public_base_url)?,
+    );
+    variables.insert(
+        "homebrew.ssh_session_install".to_string(),
+        ssh_session_install(manifest),
+    );
     variables.extend(build_feature_variables(manifest));
     Ok(variables)
+}
+
+fn ssh_session_install(manifest: &PackageManifest) -> String {
+    let has_ssh_session = manifest.artifacts.iter().any(|artifact| {
+        artifact
+            .features
+            .iter()
+            .any(|feature| feature == "sshd" || feature == "pam")
+    });
+    if has_ssh_session {
+        "    libexec.install \"pishoo-ssh-session\"\n".to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn formula_urls(

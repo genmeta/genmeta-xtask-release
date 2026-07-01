@@ -92,11 +92,30 @@ pub fn scoop_template_variables(
         manifest.kind == PackageSystem::Scoop,
         render_scoop_json_error::WrongKindSnafu
     );
-    ensure!(!bin.is_empty(), render_scoop_json_error::MissingBinSnafu);
 
     let layout = scoop_layout(manifest, public_base_url)?;
     let mut variables = package_template_variables(package_id, metadata);
     variables.extend(build_feature_variables(manifest));
+    variables.insert(
+        "scoop.version.json".to_string(),
+        serde_json::to_string(&metadata.source_version.to_string())
+            .context(render_scoop_json_error::SerializeSnafu)?,
+    );
+    variables.insert(
+        "scoop.description.json".to_string(),
+        serde_json::to_string(&metadata.description)
+            .context(render_scoop_json_error::SerializeSnafu)?,
+    );
+    variables.insert(
+        "scoop.homepage.json".to_string(),
+        serde_json::to_string(&metadata.homepage)
+            .context(render_scoop_json_error::SerializeSnafu)?,
+    );
+    variables.insert(
+        "scoop.license.json".to_string(),
+        serde_json::to_string(&metadata.license)
+            .context(render_scoop_json_error::SerializeSnafu)?,
+    );
     variables.insert(
         "scoop.bin.json".to_string(),
         serde_json::to_string_pretty(bin).context(render_scoop_json_error::SerializeSnafu)?,

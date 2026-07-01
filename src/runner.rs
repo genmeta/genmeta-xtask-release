@@ -123,9 +123,15 @@ fn run_publish_command(
     };
     match subcommand {
         "s3" => {
-            parse_s3_publish_command_request(&context.contract, &tokens[1..])
+            let command = parse_s3_publish_command_request(&context.contract, &tokens[1..])
                 .context(run_current_dir_error::ParseS3PublishSnafu)?;
-            Err(RunCurrentDirError::PublishExecutionNotMigrated)
+            crate::s3::run(
+                &context.root,
+                &context.target_dir,
+                &context.contract,
+                &command,
+            )
+            .context(run_current_dir_error::RunS3PublishSnafu)
         }
         other => Err(RunCurrentDirError::UnknownPublishCommand {
             command: other.to_string(),
@@ -383,6 +389,7 @@ fn run_docker_package(
     }
     build.arg(".");
     run_command(&mut build).context(run_current_dir_error::BuildDockerImageSnafu { dockerfile })?;
+    let container_cargo_home = container_cargo_home(&image)?;
 
     let mut run = Command::new("docker");
     run.arg("run").arg("--rm");
@@ -390,7 +397,7 @@ fn run_docker_package(
         "{}:{WORKSPACE_CONTAINER_PATH}",
         context.root.to_string_lossy()
     ));
-    mount_cargo_cache(&mut run);
+    mount_cargo_cache(&mut run, &container_cargo_home)?;
     for mount in env_mounts {
         run.arg("--volume").arg(format!(
             "{}:{}{}",
@@ -417,7 +424,9 @@ fn run_docker_package(
         run.arg("--volume").arg(format!(
             "{}:{}:ro",
             cargo_config.to_string_lossy(),
-            overlay.cargo_config_path.to_string_lossy()
+            Path::new(&container_cargo_home)
+                .join("config.toml")
+                .to_string_lossy()
         ));
     }
     for (name, value) in envs {
@@ -427,17 +436,68 @@ fn run_docker_package(
     run_command(&mut run).context(run_current_dir_error::RunDockerImageSnafu { image })
 }
 
-fn mount_cargo_cache(command: &mut Command) {
-    let cargo_home = env::var("CARGO_HOME")
-        .unwrap_or_else(|_| format!("{}/.cargo", env::var("HOME").unwrap_or_default()));
+fn container_cargo_home(image: &str) -> Result<String, RunCurrentDirError> {
+    let output = Command::new("docker")
+        .arg("run")
+        .arg("--rm")
+        .arg("--entrypoint")
+        .arg("/bin/sh")
+        .arg(image)
+        .arg("-lc")
+        .arg("printf %s \"${CARGO_HOME:-}\"")
+        .output()
+        .context(run_current_dir_error::ContainerCargoHomeCommandSnafu {
+            image: image.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(RunCurrentDirError::ContainerCargoHomeStatus {
+            image: image.to_string(),
+        });
+    }
+    let cargo_home = String::from_utf8(output.stdout).context(
+        run_current_dir_error::ContainerCargoHomeUtf8Snafu {
+            image: image.to_string(),
+        },
+    )?;
+    let cargo_home = cargo_home.trim().to_string();
+    if cargo_home.is_empty() {
+        return Err(RunCurrentDirError::MissingContainerCargoHome {
+            image: image.to_string(),
+        });
+    }
+    Ok(cargo_home)
+}
+
+fn mount_cargo_cache(
+    command: &mut Command,
+    container_cargo_home: &str,
+) -> Result<(), RunCurrentDirError> {
+    let cargo_home = host_cargo_home()?;
     for subdir in ["git", "registry"] {
         let host = Path::new(&cargo_home).join(subdir);
-        if host.is_dir() {
-            command
-                .arg("--volume")
-                .arg(format!("{}:/opt/cargo/{subdir}", host.to_string_lossy()));
-        }
+        fs::create_dir_all(&host)
+            .context(run_current_dir_error::CreateHostCargoCacheSnafu { path: host.clone() })?;
+        command.arg("--volume").arg(format!(
+            "{}:{}/{}",
+            host.to_string_lossy(),
+            container_cargo_home.trim_end_matches('/'),
+            subdir
+        ));
     }
+    Ok(())
+}
+
+fn host_cargo_home() -> Result<PathBuf, RunCurrentDirError> {
+    if let Some(cargo_home) = env::var_os("CARGO_HOME")
+        && !cargo_home.is_empty()
+    {
+        return Ok(PathBuf::from(cargo_home));
+    }
+    let home = env::var_os("HOME").ok_or(RunCurrentDirError::MissingHostCargoHome)?;
+    if home.is_empty() {
+        return Err(RunCurrentDirError::MissingHostCargoHome);
+    }
+    Ok(PathBuf::from(home).join(".cargo"))
 }
 
 fn run_command(command: &mut Command) -> Result<(), RunCommandError> {
@@ -782,6 +842,27 @@ pub enum RunCurrentDirError {
         source: RunCommandError,
         dockerfile: PathBuf,
     },
+    #[snafu(display("failed to read package docker image cargo home"))]
+    ContainerCargoHomeCommand {
+        source: std::io::Error,
+        image: String,
+    },
+    #[snafu(display("package docker image cargo home command failed"))]
+    ContainerCargoHomeStatus { image: String },
+    #[snafu(display("package docker image cargo home was not utf-8"))]
+    ContainerCargoHomeUtf8 {
+        source: std::string::FromUtf8Error,
+        image: String,
+    },
+    #[snafu(display("package docker image does not define CARGO_HOME"))]
+    MissingContainerCargoHome { image: String },
+    #[snafu(display("host CARGO_HOME is not defined"))]
+    MissingHostCargoHome,
+    #[snafu(display("failed to create host cargo cache directory"))]
+    CreateHostCargoCache {
+        source: std::io::Error,
+        path: PathBuf,
+    },
     #[snafu(display("failed to write container cargo config"))]
     WriteCargoConfig {
         source: std::io::Error,
@@ -872,6 +953,9 @@ pub enum RunCurrentDirError {
     ParseS3Publish {
         source: ParseS3PublishCommandRequestError,
     },
-    #[snafu(display("s3 publish execution has not been migrated to the shared runner"))]
-    PublishExecutionNotMigrated,
+    #[snafu(display("failed to run s3 publish command"))]
+    RunS3Publish {
+        #[snafu(source(from(crate::s3::S3PublishError, Box::new)))]
+        source: Box<crate::s3::S3PublishError>,
+    },
 }

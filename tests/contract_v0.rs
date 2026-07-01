@@ -771,10 +771,6 @@ fn sibling_container_plan_mounts_cli_sources_and_writes_container_patch_config()
             },
         ]
     );
-    assert_eq!(
-        plan.cargo_config_path,
-        std::path::PathBuf::from("/opt/cargo/config.toml")
-    );
     assert!(
         plan.cargo_config
             .contains("dhttp = { path = \"/sources/dhttp/.\" }")
