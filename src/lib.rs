@@ -1,4 +1,5 @@
 pub mod brew;
+pub mod channel;
 pub mod cli;
 pub mod contract;
 pub mod manifest;
