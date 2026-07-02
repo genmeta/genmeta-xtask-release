@@ -637,7 +637,7 @@ fn deb_metadata(path: &Path) -> Result<PackageFileMetadata, RunCurrentDirError> 
 }
 
 fn rpm_metadata(path: &Path) -> Result<PackageFileMetadata, RunCurrentDirError> {
-    let command = rpm_metadata_command(path, host_rpm_available())?;
+    let command = rpm_metadata_command(path)?;
     let output = Command::new(&command.program)
         .args(&command.args)
         .output()
@@ -667,24 +667,12 @@ struct RpmMetadataCommand {
     args: Vec<String>,
 }
 
-fn rpm_metadata_command(
-    path: &Path,
-    host_rpm_available: bool,
-) -> Result<RpmMetadataCommand, RunCurrentDirError> {
+fn rpm_metadata_command(path: &Path) -> Result<RpmMetadataCommand, RunCurrentDirError> {
     let query_args = [
         "-qp".to_string(),
         "--queryformat".to_string(),
         "%{NAME}\n%{VERSION}-%{RELEASE}\n%{ARCH}\n".to_string(),
     ];
-    if host_rpm_available {
-        let mut args = query_args.to_vec();
-        args.push(path.to_string_lossy().into_owned());
-        return Ok(RpmMetadataCommand {
-            program: "rpm".to_string(),
-            args,
-        });
-    }
-
     let parent = path
         .parent()
         .context(run_current_dir_error::RpmMetadataParentSnafu {
@@ -709,15 +697,6 @@ fn rpm_metadata_command(
         program: "docker".to_string(),
         args,
     })
-}
-
-fn host_rpm_available() -> bool {
-    Command::new("rpm")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 fn stanza_field(stanza: &str, field: &str) -> Option<String> {
@@ -828,20 +807,8 @@ mod tests {
     use super::rpm_metadata_command;
 
     #[test]
-    fn rpm_metadata_command_uses_host_rpm_when_available() {
-        let command = rpm_metadata_command(Path::new("/tmp/sample.rpm"), true)
-            .expect("host rpm command should resolve");
-
-        assert_eq!(command.program, "rpm");
-        assert_eq!(
-            command.args.last().map(String::as_str),
-            Some("/tmp/sample.rpm")
-        );
-    }
-
-    #[test]
-    fn rpm_metadata_command_uses_fedora_container_without_host_rpm() {
-        let command = rpm_metadata_command(Path::new("/tmp/out/sample.rpm"), false)
+    fn rpm_metadata_command_uses_fedora_container() {
+        let command = rpm_metadata_command(Path::new("/tmp/out/sample.rpm"))
             .expect("container rpm command should resolve");
 
         assert_eq!(command.program, "docker");
