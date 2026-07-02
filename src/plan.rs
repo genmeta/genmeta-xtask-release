@@ -262,11 +262,12 @@ pub struct PlannedS3Publish {
 pub fn s3_publish_command_plan(
     contract: &ReleaseContract,
     command: &S3PublishCommandRequest,
+    channel: crate::channel::ReleaseChannel,
     values: &BTreeMap<String, String>,
 ) -> Result<Vec<PlannedS3Publish>, S3PublishCommandPlanError> {
     let mut plans = Vec::new();
     for system in &command.systems {
-        let target = crate::publish::resolve_s3_publish_target(contract, *system, values)
+        let target = crate::publish::resolve_s3_publish_target(contract, *system, channel, values)
             .context(s3_publish_command_plan_error::TargetSnafu { system: *system })?;
         plans.push(PlannedS3Publish {
             system: *system,

@@ -7,6 +7,7 @@ use semver::Version;
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 
 use crate::{
+    channel::ReleaseChannel,
     contract::{EnvRef, ReleaseContract},
     manifest::PackageManifest,
     package::PackageId,
@@ -739,17 +740,20 @@ pub struct S3BrewPublishTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TapPublishTarget {
+pub struct GitIndexPublishTarget {
     pub repository: String,
     pub base_branch: String,
     pub token: String,
 }
+
+pub type TapPublishTarget = GitIndexPublishTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3ScoopPublishTarget {
     pub common: S3CommonPublishTarget,
     pub prefix: RemotePrefix,
     pub public_base_url: PublicBaseUrl,
+    pub bucket: GitIndexPublishTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -785,15 +789,18 @@ pub fn s3_publish_env_names(
                 .brew
                 .as_ref()
                 .ok_or(S3PublishEnvNamesError::MissingBranch { system })?;
-            collect_env_ref(&mut names, &branch.tap.token);
+            collect_env_ref(&mut names, &branch.stable.tap.token);
+            collect_env_ref(&mut names, &branch.preview.tap.token);
         }
         PackageSystem::Scoop => {
-            contract
+            let branch = contract
                 .destination
                 .s3
                 .scoop
                 .as_ref()
                 .ok_or(S3PublishEnvNamesError::MissingBranch { system })?;
+            collect_env_ref(&mut names, &branch.stable.bucket.token);
+            collect_env_ref(&mut names, &branch.preview.bucket.token);
         }
         PackageSystem::Deb => {
             let branch = contract
@@ -804,9 +811,7 @@ pub fn s3_publish_env_names(
                 .ok_or(S3PublishEnvNamesError::MissingBranch { system })?;
             collect_env_ref(&mut names, &branch.signing.key);
             collect_env_ref(&mut names, &branch.signing.passphrase);
-            if let Some(fingerprint) = &branch.fingerprint {
-                collect_env_ref(&mut names, fingerprint);
-            }
+            collect_env_ref(&mut names, &branch.signing.fingerprint);
         }
         PackageSystem::Rpm => {
             contract
@@ -835,6 +840,7 @@ pub enum S3PublishEnvNamesError {
 pub fn resolve_s3_publish_target(
     contract: &ReleaseContract,
     system: PackageSystem,
+    channel: ReleaseChannel,
     values: &BTreeMap<String, String>,
 ) -> Result<S3PublishTarget, ResolveS3PublishTargetError> {
     let common = resolve_s3_common(contract, values)?;
@@ -845,16 +851,20 @@ pub fn resolve_s3_publish_target(
                     system: PackageSystem::Brew,
                 },
             )?;
+            let destination = match channel {
+                ReleaseChannel::Stable => &branch.stable,
+                ReleaseChannel::Preview => &branch.preview,
+            };
             Ok(S3PublishTarget::Brew(S3BrewPublishTarget {
                 common,
-                prefix: RemotePrefix::parse(&branch.prefix)
+                prefix: RemotePrefix::parse(&destination.prefix)
                     .context(resolve_s3_publish_target_error::RemotePrefixSnafu)?,
-                public_base_url: PublicBaseUrl::parse(&branch.public_base_url)
+                public_base_url: PublicBaseUrl::parse(&destination.public_base_url)
                     .context(resolve_s3_publish_target_error::PublicBaseUrlSnafu)?,
-                tap: TapPublishTarget {
-                    repository: branch.tap.repository.clone(),
-                    base_branch: branch.tap.base_branch.clone(),
-                    token: resolve_env_ref(&branch.tap.token, values)?,
+                tap: GitIndexPublishTarget {
+                    repository: destination.tap.repository.clone(),
+                    base_branch: destination.tap.base_branch.clone(),
+                    token: resolve_env_ref(&destination.tap.token, values)?,
                 },
             }))
         }
@@ -864,12 +874,21 @@ pub fn resolve_s3_publish_target(
                     system: PackageSystem::Scoop,
                 },
             )?;
+            let destination = match channel {
+                ReleaseChannel::Stable => &branch.stable,
+                ReleaseChannel::Preview => &branch.preview,
+            };
             Ok(S3PublishTarget::Scoop(S3ScoopPublishTarget {
                 common,
-                prefix: RemotePrefix::parse(&branch.prefix)
+                prefix: RemotePrefix::parse(&destination.prefix)
                     .context(resolve_s3_publish_target_error::RemotePrefixSnafu)?,
-                public_base_url: PublicBaseUrl::parse(&branch.public_base_url)
+                public_base_url: PublicBaseUrl::parse(&destination.public_base_url)
                     .context(resolve_s3_publish_target_error::PublicBaseUrlSnafu)?,
+                bucket: GitIndexPublishTarget {
+                    repository: destination.bucket.repository.clone(),
+                    base_branch: destination.bucket.base_branch.clone(),
+                    token: resolve_env_ref(&destination.bucket.token, values)?,
+                },
             }))
         }
         PackageSystem::Deb => {
@@ -878,19 +897,18 @@ pub fn resolve_s3_publish_target(
                     system: PackageSystem::Deb,
                 },
             )?;
-            let fingerprint = branch.fingerprint.as_ref().ok_or(
-                ResolveS3PublishTargetError::MissingFingerprintRef {
-                    system: PackageSystem::Deb,
-                },
-            )?;
+            let destination = match channel {
+                ReleaseChannel::Stable => &branch.stable,
+                ReleaseChannel::Preview => &branch.preview,
+            };
             Ok(S3PublishTarget::Deb(S3DebPublishTarget {
                 common,
-                prefix: RemotePrefix::parse(&branch.prefix)
+                prefix: RemotePrefix::parse(&destination.prefix)
                     .context(resolve_s3_publish_target_error::RemotePrefixSnafu)?,
-                suite: branch.suite.clone(),
+                suite: destination.suite.clone(),
                 signing_key: resolve_env_ref(&branch.signing.key, values)?,
                 signing_passphrase: resolve_optional_env_ref(&branch.signing.passphrase, values)?,
-                fingerprint: resolve_env_ref(fingerprint, values)?,
+                fingerprint: resolve_env_ref(&branch.signing.fingerprint, values)?,
             }))
         }
         PackageSystem::Rpm => {
@@ -899,9 +917,13 @@ pub fn resolve_s3_publish_target(
                     system: PackageSystem::Rpm,
                 },
             )?;
+            let destination = match channel {
+                ReleaseChannel::Stable => &branch.stable,
+                ReleaseChannel::Preview => &branch.preview,
+            };
             Ok(S3PublishTarget::Rpm(S3RpmPublishTarget {
                 common,
-                prefix: RemotePrefix::parse(&branch.prefix)
+                prefix: RemotePrefix::parse(&destination.prefix)
                     .context(resolve_s3_publish_target_error::RemotePrefixSnafu)?,
             }))
         }
@@ -957,8 +979,6 @@ fn resolve_optional_env_ref(
 pub enum ResolveS3PublishTargetError {
     #[snafu(display("destination s3 {system} branch missing"))]
     MissingBranch { system: PackageSystem },
-    #[snafu(display("destination s3 {system} fingerprint env missing"))]
-    MissingFingerprintRef { system: PackageSystem },
     #[snafu(display("missing required release environment variable {name}"))]
     MissingEnv { name: String },
     #[snafu(display("release environment variable {name} must not be empty"))]
@@ -1023,4 +1043,194 @@ impl PublicBaseUrl {
 pub enum PublicBaseUrlError {
     #[snafu(display("public base url must not be empty"))]
     EmptyPublicBaseUrl,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::{
+        channel::ReleaseChannel,
+        contract::ReleaseContract,
+        publish::{S3PublishTarget, resolve_s3_publish_target},
+        system::PackageSystem,
+    };
+
+    fn contract() -> ReleaseContract {
+        toml::from_str(
+            r#"
+                [package.product]
+                version = "1.2.3-beta.1"
+                description = "product"
+                license = "Apache-2.0"
+                homepage = "https://example.test"
+
+                [package.product.deb]
+                revision = "1"
+                architecture = "target"
+                dockerfile = "xtask/release/deb/Dockerfile"
+
+                [package.product.rpm]
+                release = "1"
+                architecture = "target"
+                dockerfile = "xtask/release/rpm/Dockerfile"
+
+                [package.product.brew]
+                script = "xtask/release/brew/product.sh"
+                manifest_template = "xtask/templates/product.rb.in"
+
+                [package.product.scoop]
+                script = "xtask/release/scoop/product.sh"
+                manifest_template = "xtask/templates/product.json.in"
+
+                [destination.s3]
+                bucket = "download"
+                endpoint.env = "S3_ENDPOINT"
+                access_key_id.env = "S3_ACCESS_KEY_ID"
+                secret_access_key.env = "S3_SECRET_ACCESS_KEY"
+
+                [destination.s3.deb.stable]
+                prefix = "ppa/genmeta"
+                suite = "stable"
+
+                [destination.s3.deb.preview]
+                prefix = "ppa/genmeta"
+                suite = "preview"
+
+                [destination.s3.deb.signing]
+                key.env = "APT_SIGNING_KEY"
+                passphrase.env = "APT_SIGNING_PASSPHRASE"
+                fingerprint.env = "APT_SIGNING_FINGERPRINT"
+
+                [destination.s3.rpm.stable]
+                prefix = "rpm/stable"
+
+                [destination.s3.rpm.preview]
+                prefix = "rpm/preview"
+
+                [destination.s3.brew.stable]
+                prefix = "homebrew/stable"
+                public_base_url = "https://download.dhttp.net/homebrew/stable"
+                tap.repository = "genmeta/homebrew-stable"
+                tap.base_branch = "main"
+                tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+                [destination.s3.brew.preview]
+                prefix = "homebrew/preview"
+                public_base_url = "https://download.dhttp.net/homebrew/preview"
+                tap.repository = "genmeta/homebrew-preview"
+                tap.base_branch = "main"
+                tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+                [destination.s3.scoop.stable]
+                prefix = "scoop/stable"
+                public_base_url = "https://download.dhttp.net/scoop/stable"
+                bucket.repository = "genmeta/scoop-stable"
+                bucket.base_branch = "main"
+                bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+                [destination.s3.scoop.preview]
+                prefix = "scoop/preview"
+                public_base_url = "https://download.dhttp.net/scoop/preview"
+                bucket.repository = "genmeta/scoop-preview"
+                bucket.base_branch = "main"
+                bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+            "#,
+        )
+        .expect("contract should parse")
+    }
+
+    fn values() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "S3_ENDPOINT".to_string(),
+                "https://r2.example.test".to_string(),
+            ),
+            ("S3_ACCESS_KEY_ID".to_string(), "access".to_string()),
+            ("S3_SECRET_ACCESS_KEY".to_string(), "secret".to_string()),
+            ("APT_SIGNING_KEY".to_string(), "key".to_string()),
+            ("APT_SIGNING_PASSPHRASE".to_string(), "pass".to_string()),
+            (
+                "APT_SIGNING_FINGERPRINT".to_string(),
+                "0123456789ABCDEF".to_string(),
+            ),
+            ("HOMEBREW_TAP_GITHUB_TOKEN".to_string(), "token".to_string()),
+        ])
+    }
+
+    #[test]
+    fn preview_channel_selects_preview_destinations() {
+        let contract = contract();
+        let values = values();
+
+        let target = resolve_s3_publish_target(
+            &contract,
+            PackageSystem::Deb,
+            ReleaseChannel::Preview,
+            &values,
+        )
+        .expect("deb target should resolve");
+        let S3PublishTarget::Deb(target) = target else {
+            panic!("expected deb target");
+        };
+        assert_eq!(target.prefix.as_str(), "ppa/genmeta");
+        assert_eq!(target.suite, "preview");
+
+        let target = resolve_s3_publish_target(
+            &contract,
+            PackageSystem::Rpm,
+            ReleaseChannel::Preview,
+            &values,
+        )
+        .expect("rpm target should resolve");
+        let S3PublishTarget::Rpm(target) = target else {
+            panic!("expected rpm target");
+        };
+        assert_eq!(target.prefix.as_str(), "rpm/preview");
+
+        let target = resolve_s3_publish_target(
+            &contract,
+            PackageSystem::Brew,
+            ReleaseChannel::Preview,
+            &values,
+        )
+        .expect("brew target should resolve");
+        let S3PublishTarget::Brew(target) = target else {
+            panic!("expected brew target");
+        };
+        assert_eq!(target.prefix.as_str(), "homebrew/preview");
+        assert_eq!(target.tap.repository, "genmeta/homebrew-preview");
+
+        let target = resolve_s3_publish_target(
+            &contract,
+            PackageSystem::Scoop,
+            ReleaseChannel::Preview,
+            &values,
+        )
+        .expect("scoop target should resolve");
+        let S3PublishTarget::Scoop(target) = target else {
+            panic!("expected scoop target");
+        };
+        assert_eq!(target.prefix.as_str(), "scoop/preview");
+        assert_eq!(target.bucket.repository, "genmeta/scoop-preview");
+    }
+
+    #[test]
+    fn stable_channel_selects_stable_destinations() {
+        let contract = contract();
+        let values = values();
+
+        let target = resolve_s3_publish_target(
+            &contract,
+            PackageSystem::Brew,
+            ReleaseChannel::Stable,
+            &values,
+        )
+        .expect("brew target should resolve");
+        let S3PublishTarget::Brew(target) = target else {
+            panic!("expected brew target");
+        };
+        assert_eq!(target.prefix.as_str(), "homebrew/stable");
+        assert_eq!(target.tap.repository, "genmeta/homebrew-stable");
+    }
 }

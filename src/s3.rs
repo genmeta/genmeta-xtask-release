@@ -17,6 +17,7 @@ use walkdir::WalkDir;
 use crate::{
     brew::BrewTemplateVariableError,
     brew::brew_template_variables,
+    channel::ReleaseChannel,
     cli::S3PublishCommandRequest,
     contract::ReleaseContract,
     manifest::{
@@ -287,18 +288,28 @@ fn run_inner(
         dry_run: command.dry_run,
     };
     for manifest in manifests {
-        let target = resolve_s3_publish_target(contract, manifest.kind, &values)
+        let (package_id, metadata) = manifest_package_metadata(root, contract, &manifest)?;
+        let channel = ReleaseChannel::from_version(&metadata.source_version);
+        let target = resolve_s3_publish_target(contract, manifest.kind, channel, &values)
             .context(s3_publish_error::ResolveTargetSnafu)?;
+        eprintln!(
+            "publish s3 {} channel={} target={}",
+            manifest.kind,
+            channel.as_str(),
+            target_summary(&target)
+        );
         let client = s3_client(target.common())?;
         match target {
             S3PublishTarget::Brew(target) => {
                 publish_brew(
-                    root, target_dir, contract, &options, &client, target, manifest,
+                    root, target_dir, contract, &options, &client, target, package_id, metadata,
+                    manifest,
                 )?;
             }
             S3PublishTarget::Scoop(target) => {
                 publish_scoop(
-                    root, target_dir, contract, &options, &client, target, manifest,
+                    root, target_dir, contract, &options, &client, target, package_id, metadata,
+                    manifest,
                 )?;
             }
             S3PublishTarget::Deb(target) => {
@@ -312,6 +323,18 @@ fn run_inner(
     Ok(())
 }
 
+fn manifest_package_metadata(
+    root: &Path,
+    contract: &ReleaseContract,
+    manifest: &PackageManifest,
+) -> Result<(PackageId, crate::package::ResolvedPackageMetadata), S3PublishError> {
+    let package_id = PackageId::new(manifest.package.clone())
+        .context(s3_publish_error::InvalidPackageIdSnafu)?;
+    let metadata = resolve_metadata(contract, package_id.as_str(), root)
+        .context(s3_publish_error::ResolveMetadataSnafu)?;
+    Ok((package_id, metadata))
+}
+
 fn s3_client(common: &S3CommonPublishTarget) -> Result<S3Client, S3PublishError> {
     Ok(S3Client {
         endpoint: Url::parse(&common.endpoint_url)
@@ -321,6 +344,27 @@ fn s3_client(common: &S3CommonPublishTarget) -> Result<S3Client, S3PublishError>
     })
 }
 
+fn target_summary(target: &S3PublishTarget) -> String {
+    match target {
+        S3PublishTarget::Brew(target) => {
+            format!(
+                "prefix={} tap={}",
+                target.prefix.as_str(),
+                target.tap.repository
+            )
+        }
+        S3PublishTarget::Scoop(target) => format!(
+            "prefix={} bucket={}",
+            target.prefix.as_str(),
+            target.bucket.repository
+        ),
+        S3PublishTarget::Deb(target) => {
+            format!("prefix={} suite={}", target.prefix.as_str(), target.suite)
+        }
+        S3PublishTarget::Rpm(target) => format!("prefix={}", target.prefix.as_str()),
+    }
+}
+
 fn publish_brew(
     root: &Path,
     target_dir: &Path,
@@ -328,6 +372,8 @@ fn publish_brew(
     options: &S3Options,
     client: &S3Client,
     target: S3BrewPublishTarget,
+    package_id: PackageId,
+    metadata: crate::package::ResolvedPackageMetadata,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
     let (mut uploads, manifest) = plan_versioned_archive_uploads(
@@ -337,10 +383,6 @@ fn publish_brew(
         &target.prefix,
         manifest,
     )?;
-    let package_id = PackageId::new(manifest.package.clone())
-        .context(s3_publish_error::InvalidPackageIdSnafu)?;
-    let metadata = resolve_metadata(contract, package_id.as_str(), root)
-        .context(s3_publish_error::ResolveMetadataSnafu)?;
     let template = manifest_template(root, contract, &package_id, PackageSystem::Brew)?;
     let variables =
         brew_template_variables(&package_id, &metadata, &manifest, &target.public_base_url)
@@ -383,6 +425,8 @@ fn publish_scoop(
     options: &S3Options,
     client: &S3Client,
     target: S3ScoopPublishTarget,
+    package_id: PackageId,
+    metadata: crate::package::ResolvedPackageMetadata,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
     let (mut uploads, manifest) = plan_versioned_archive_uploads(
@@ -392,10 +436,6 @@ fn publish_scoop(
         &target.prefix,
         manifest,
     )?;
-    let package_id = PackageId::new(manifest.package.clone())
-        .context(s3_publish_error::InvalidPackageIdSnafu)?;
-    let metadata = resolve_metadata(contract, package_id.as_str(), root)
-        .context(s3_publish_error::ResolveMetadataSnafu)?;
     let template = manifest_template(root, contract, &package_id, PackageSystem::Scoop)?;
     let variables = crate::scoop::scoop_template_variables(
         &package_id,

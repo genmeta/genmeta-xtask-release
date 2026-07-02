@@ -1078,10 +1078,16 @@ fn s3_publish_command_plan_connects_cli_systems_to_targets_and_scripts() {
             "XTASK_RELEASE_APT_SIGNING_FINGERPRINT".to_string(),
             "fingerprint".to_string(),
         ),
+        ("HOMEBREW_TAP_GITHUB_TOKEN".to_string(), "token".to_string()),
     ]);
 
-    let plans = genmeta_xtask_release::plan::s3_publish_command_plan(&contract, &command, &values)
-        .expect("s3 publish command should plan");
+    let plans = genmeta_xtask_release::plan::s3_publish_command_plan(
+        &contract,
+        &command,
+        genmeta_xtask_release::channel::ReleaseChannel::Stable,
+        &values,
+    )
+    .expect("s3 publish command should plan");
 
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].system, PackageSystem::Deb);
@@ -1100,11 +1106,12 @@ fn s3_publish_command_plan_connects_cli_systems_to_targets_and_scripts() {
     assert!(plans[1].invocation.is_none());
     match &plans[1].target {
         genmeta_xtask_release::publish::S3PublishTarget::Scoop(target) => {
-            assert_eq!(target.prefix.as_str(), "scoop");
+            assert_eq!(target.prefix.as_str(), "scoop/stable");
             assert_eq!(
                 target.public_base_url.as_str(),
-                "https://download.dhttp.net/scoop"
+                "https://download.dhttp.net/scoop/stable"
             );
+            assert_eq!(target.bucket.repository, "genmeta/scoop-stable");
         }
         _ => panic!("expected scoop publish target"),
     }
@@ -2130,11 +2137,17 @@ endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
 access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
 secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 
-[destination.s3.deb]
+[destination.s3.deb.stable]
 prefix = "ppa/sample"
 suite = "sample"
-signing.key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
-signing.passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
+
+[destination.s3.deb.preview]
+prefix = "ppa/sample"
+suite = "preview"
+
+[destination.s3.deb.signing]
+key.env = "XTASK_RELEASE_APT_SIGNING_KEY"
+passphrase.env = "XTASK_RELEASE_APT_SIGNING_PASSPHRASE"
 fingerprint.env = "XTASK_RELEASE_APT_SIGNING_FINGERPRINT"
 
 "#;
@@ -3202,19 +3215,24 @@ fn s3_brew_publish_target_resolves_from_destination_s3_branch() {
         ("HOMEBREW_TAP_GITHUB_TOKEN".to_string(), "token".to_string()),
     ]);
 
-    let target = resolve_s3_publish_target(&contract, PackageSystem::Brew, &values)
-        .expect("brew target should resolve");
+    let target = resolve_s3_publish_target(
+        &contract,
+        PackageSystem::Brew,
+        genmeta_xtask_release::channel::ReleaseChannel::Stable,
+        &values,
+    )
+    .expect("brew target should resolve");
 
     assert_eq!(target.bucket(), "download");
     assert_eq!(target.endpoint_url(), "https://r2.example");
     match target {
         S3PublishTarget::Brew(target) => {
-            assert_eq!(target.prefix.as_str(), "homebrew");
+            assert_eq!(target.prefix.as_str(), "homebrew/stable");
             assert_eq!(
                 target.public_base_url.as_str(),
-                "https://download.dhttp.net/homebrew"
+                "https://download.dhttp.net/homebrew/stable"
             );
-            assert_eq!(target.tap.repository, "genmeta/homebrew-genmeta");
+            assert_eq!(target.tap.repository, "genmeta/homebrew-stable");
             assert_eq!(target.tap.token, "token");
         }
         _ => panic!("expected brew target"),
@@ -3249,8 +3267,13 @@ fn s3_deb_publish_target_requires_fingerprint_env() {
         ),
     ]);
 
-    let error = resolve_s3_publish_target(&contract, PackageSystem::Deb, &values)
-        .expect_err("missing fingerprint should fail");
+    let error = resolve_s3_publish_target(
+        &contract,
+        PackageSystem::Deb,
+        genmeta_xtask_release::channel::ReleaseChannel::Stable,
+        &values,
+    )
+    .expect_err("missing fingerprint should fail");
 
     assert_eq!(
         error.to_string(),
@@ -4032,10 +4055,17 @@ endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
 access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
 secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 
-[destination.s3.brew]
+[destination.s3.brew.stable]
 prefix = "///"
-public_base_url = "https://download.example/homebrew"
-tap.repository = "genmeta/homebrew-genmeta"
+public_base_url = "https://download.example/homebrew/stable"
+tap.repository = "genmeta/homebrew-stable"
+tap.base_branch = "main"
+tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+[destination.s3.brew.preview]
+prefix = "homebrew/preview"
+public_base_url = "https://download.example/homebrew/preview"
+tap.repository = "genmeta/homebrew-preview"
 tap.base_branch = "main"
 tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
 "#;
@@ -4057,8 +4087,13 @@ tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
         ("HOMEBREW_TAP_GITHUB_TOKEN".to_string(), "token".to_string()),
     ]);
 
-    let error = resolve_s3_publish_target(&contract, PackageSystem::Brew, &values)
-        .expect_err("empty prefix should fail");
+    let error = resolve_s3_publish_target(
+        &contract,
+        PackageSystem::Brew,
+        genmeta_xtask_release::channel::ReleaseChannel::Stable,
+        &values,
+    )
+    .expect_err("empty prefix should fail");
 
     assert_eq!(error.to_string(), "invalid remote prefix");
 }
@@ -4083,9 +4118,19 @@ endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
 access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
 secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 
-[destination.s3.scoop]
-prefix = "scoop"
-public_base_url = "https://download.dhttp.net/scoop"
+[destination.s3.scoop.stable]
+prefix = "scoop/stable"
+public_base_url = "https://download.dhttp.net/scoop/stable"
+bucket.repository = "genmeta/scoop-stable"
+bucket.base_branch = "main"
+bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+[destination.s3.scoop.preview]
+prefix = "scoop/preview"
+public_base_url = "https://download.dhttp.net/scoop/preview"
+bucket.repository = "genmeta/scoop-preview"
+bucket.base_branch = "main"
+bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
 "#;
 
     let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
@@ -4234,8 +4279,13 @@ fn s3_deb_publish_target_allows_missing_local_signing_passphrase() {
         ),
     ]);
 
-    let target = resolve_s3_publish_target(&contract, PackageSystem::Deb, &values)
-        .expect("deb publish target should allow missing local passphrase");
+    let target = resolve_s3_publish_target(
+        &contract,
+        PackageSystem::Deb,
+        genmeta_xtask_release::channel::ReleaseChannel::Stable,
+        &values,
+    )
+    .expect("deb publish target should allow missing local passphrase");
 
     match target {
         S3PublishTarget::Deb(target) => {
@@ -4279,8 +4329,13 @@ fn s3_deb_publish_target_rejects_empty_signing_passphrase() {
         ),
     ]);
 
-    let error = resolve_s3_publish_target(&contract, PackageSystem::Deb, &values)
-        .expect_err("empty passphrase should fail");
+    let error = resolve_s3_publish_target(
+        &contract,
+        PackageSystem::Deb,
+        genmeta_xtask_release::channel::ReleaseChannel::Stable,
+        &values,
+    )
+    .expect_err("empty passphrase should fail");
 
     assert_eq!(
         error.to_string(),

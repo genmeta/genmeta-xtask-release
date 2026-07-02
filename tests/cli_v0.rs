@@ -461,9 +461,19 @@ endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
 access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
 secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 
-[destination.s3.scoop]
-prefix = "scoop"
-public_base_url = "https://download.dhttp.net/scoop"
+[destination.s3.scoop.stable]
+prefix = "scoop/stable"
+public_base_url = "https://download.dhttp.net/scoop/stable"
+bucket.repository = "genmeta/scoop-stable"
+bucket.base_branch = "main"
+bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+[destination.s3.scoop.preview]
+prefix = "scoop/preview"
+public_base_url = "https://download.dhttp.net/scoop/preview"
+bucket.repository = "genmeta/scoop-preview"
+bucket.base_branch = "main"
+bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
 "#;
     let contract: genmeta_xtask_release::contract::ReleaseContract =
         toml::from_str(input).expect("contract should parse");

@@ -24,6 +24,8 @@ enum XtaskCommandCli {
     Package(PackageCommandCli),
     /// Publish package manifests
     Publish(PublishCommandCli),
+    /// Print derived release metadata for workflows
+    Show(ShowCommandCli),
 }
 
 #[derive(Debug, Args)]
@@ -95,15 +97,47 @@ struct S3PublishCommandParser {
     command: S3PublishCommandCli,
 }
 
+#[derive(Debug, Args)]
+struct ShowCommandCli {
+    #[command(subcommand)]
+    command: ShowSubcommandCli,
+}
+
+#[derive(Debug, Subcommand)]
+enum ShowSubcommandCli {
+    /// Print the channel-selected S3 destination for a package system
+    S3Destination(ShowS3DestinationCli),
+}
+
+#[derive(Debug, Args)]
+struct ShowS3DestinationCli {
+    #[arg(value_parser = parse_package_system)]
+    system: PackageSystem,
+    #[arg(long)]
+    github_output: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XtaskCommandRequest {
     Package(PackageCommandRequest),
     Publish(PublishCommandRequest),
+    Show(ShowCommandRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishCommandRequest {
     S3(S3PublishCommandRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShowCommandRequest {
+    S3Destination(ShowS3DestinationRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowS3DestinationRequest {
+    pub system: PackageSystem,
+    pub github_output: bool,
 }
 
 pub fn parse_xtask_command_request<I, T>(
@@ -122,6 +156,9 @@ where
         XtaskCommandCli::Publish(command) => publish_command_request(contract, command)
             .map(XtaskCommandRequest::Publish)
             .context(parse_xtask_command_request_error::PublishSnafu),
+        XtaskCommandCli::Show(command) => show_command_request(contract, command)
+            .map(XtaskCommandRequest::Show)
+            .context(parse_xtask_command_request_error::ShowSnafu),
     }
 }
 
@@ -141,6 +178,9 @@ where
         XtaskCommandCli::Publish(command) => publish_command_request(contract, command)
             .map(XtaskCommandRequest::Publish)
             .context(parse_xtask_command_request_error::PublishSnafu),
+        XtaskCommandCli::Show(command) => show_command_request(contract, command)
+            .map(XtaskCommandRequest::Show)
+            .context(parse_xtask_command_request_error::ShowSnafu),
     }
 }
 
@@ -151,6 +191,27 @@ fn publish_command_request(
     match command.command {
         PublishSubcommandCli::S3(command) => {
             s3_publish_command_request(contract, command).map(PublishCommandRequest::S3)
+        }
+    }
+}
+
+fn show_command_request(
+    contract: &ReleaseContract,
+    command: ShowCommandCli,
+) -> Result<ShowCommandRequest, ParseShowCommandRequestError> {
+    match command.command {
+        ShowSubcommandCli::S3Destination(command) => {
+            if !destination_has_s3_package_system(contract, command.system) {
+                return Err(ParseShowCommandRequestError::UndefinedDestinationBranch {
+                    system: command.system,
+                });
+            }
+            Ok(ShowCommandRequest::S3Destination(
+                ShowS3DestinationRequest {
+                    system: command.system,
+                    github_output: command.github_output,
+                },
+            ))
         }
     }
 }
@@ -178,6 +239,10 @@ pub enum ParseXtaskCommandRequestError {
     #[snafu(display("failed to parse publish command"))]
     Publish {
         source: ParseS3PublishCommandRequestError,
+    },
+    #[snafu(display("failed to parse show command"))]
+    Show {
+        source: ParseShowCommandRequestError,
     },
 }
 
@@ -625,13 +690,23 @@ pub enum ParseS3PublishRequestsError {
     UndefinedPackageSystem { system: PackageSystem },
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ParseShowCommandRequestError {
+    #[snafu(display("destination s3 {system} branch is missing"))]
+    UndefinedDestinationBranch { system: PackageSystem },
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
 
     use clap::Parser;
 
-    use super::{parse_package_command_request, parse_s3_publish_command_request};
+    use super::{
+        parse_package_command_request, parse_s3_publish_command_request,
+        parse_xtask_command_request,
+    };
     use crate::{contract::ReleaseContract, system::RequestedTarget};
 
     fn contract() -> ReleaseContract {
@@ -653,20 +728,48 @@ mod tests {
                 architecture = "target"
                 dockerfile = "xtask/release/deb/Dockerfile"
 
+                [package.product.brew]
+                script = "xtask/release/brew/product.sh"
+                manifest_template = "xtask/templates/product.rb.in"
+
                 [destination.s3]
                 bucket = "release"
                 endpoint.env = "S3_ENDPOINT"
                 access_key_id.env = "S3_ACCESS_KEY_ID"
                 secret_access_key.env = "S3_SECRET_ACCESS_KEY"
 
-                [destination.s3.rpm]
-                prefix = "rpm/product"
+                [destination.s3.rpm.stable]
+                prefix = "rpm/stable"
 
-                [destination.s3.deb]
+                [destination.s3.rpm.preview]
+                prefix = "rpm/preview"
+
+                [destination.s3.deb.stable]
                 prefix = "deb/product"
                 suite = "stable"
-                signing.key.env = "APT_SIGNING_KEY"
-                signing.passphrase.env = "APT_SIGNING_PASSPHRASE"
+
+                [destination.s3.deb.preview]
+                prefix = "deb/product"
+                suite = "preview"
+
+                [destination.s3.deb.signing]
+                key.env = "APT_SIGNING_KEY"
+                passphrase.env = "APT_SIGNING_PASSPHRASE"
+                fingerprint.env = "APT_SIGNING_FINGERPRINT"
+
+                [destination.s3.brew.stable]
+                prefix = "homebrew/stable"
+                public_base_url = "https://download.dhttp.net/homebrew/stable"
+                tap.repository = "genmeta/homebrew-stable"
+                tap.base_branch = "main"
+                tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+                [destination.s3.brew.preview]
+                prefix = "homebrew/preview"
+                public_base_url = "https://download.dhttp.net/homebrew/preview"
+                tap.repository = "genmeta/homebrew-preview"
+                tap.base_branch = "main"
+                tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
             "#,
         )
         .expect("fixture contract should parse");
@@ -747,5 +850,22 @@ mod tests {
 
         assert!(command.dry_run);
         assert_eq!(command.systems.len(), 2);
+    }
+
+    #[test]
+    fn show_s3_destination_parses_system_and_github_output_flag() {
+        let command = parse_xtask_command_request(
+            &contract(),
+            os_args(&["xtask", "show", "s3-destination", "brew", "--github-output"]),
+        )
+        .expect("show command should parse");
+
+        let super::XtaskCommandRequest::Show(super::ShowCommandRequest::S3Destination(command)) =
+            command
+        else {
+            panic!("expected show s3-destination command");
+        };
+        assert_eq!(command.system, crate::system::PackageSystem::Brew);
+        assert!(command.github_output);
     }
 }

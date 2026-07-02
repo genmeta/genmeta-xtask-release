@@ -32,7 +32,10 @@ mod tests {
     fn stable_version_selects_stable_channel() {
         let version = Version::parse("0.8.0").expect("version should parse");
 
-        assert_eq!(ReleaseChannel::from_version(&version), ReleaseChannel::Stable);
+        assert_eq!(
+            ReleaseChannel::from_version(&version),
+            ReleaseChannel::Stable
+        );
     }
 
     #[test]
@@ -40,7 +43,10 @@ mod tests {
         for input in ["0.8.0-alpha.1", "0.8.0-beta.1", "0.8.0-rc.1"] {
             let version = Version::parse(input).expect("version should parse");
 
-            assert_eq!(ReleaseChannel::from_version(&version), ReleaseChannel::Preview);
+            assert_eq!(
+                ReleaseChannel::from_version(&version),
+                ReleaseChannel::Preview
+            );
         }
     }
 

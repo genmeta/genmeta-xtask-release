@@ -133,12 +133,6 @@ impl PackageContract {
 }
 
 fn validate_source_version(id: &PackageId, version: &str) -> Result<(), ValidateContractError> {
-    if version.contains('-') {
-        return Err(ValidateContractError::PackageSystemVersionAtRoot {
-            package: id.clone(),
-            version: version.to_owned(),
-        });
-    }
     Version::parse(version).context(validate_contract_error::InvalidSourceVersionSnafu {
         package: id.clone(),
         version: version.to_owned(),
@@ -216,14 +210,17 @@ fn validate_destination_env_refs(contract: &ReleaseContract) -> Result<(), Valid
         &contract.destination.s3.secret_access_key,
     )?;
     if let Some(branch) = &contract.destination.s3.brew {
-        validate_env_ref("brew tap token", &branch.tap.token)?;
+        validate_env_ref("stable brew tap token", &branch.stable.tap.token)?;
+        validate_env_ref("preview brew tap token", &branch.preview.tap.token)?;
+    }
+    if let Some(branch) = &contract.destination.s3.scoop {
+        validate_env_ref("stable scoop bucket token", &branch.stable.bucket.token)?;
+        validate_env_ref("preview scoop bucket token", &branch.preview.bucket.token)?;
     }
     if let Some(branch) = &contract.destination.s3.deb {
         validate_env_ref("deb signing key", &branch.signing.key)?;
         validate_env_ref("deb signing passphrase", &branch.signing.passphrase)?;
-        if let Some(fingerprint) = &branch.fingerprint {
-            validate_env_ref("deb signing fingerprint", fingerprint)?;
-        }
+        validate_env_ref("deb signing fingerprint", &branch.signing.fingerprint)?;
     }
     Ok(())
 }
@@ -659,23 +656,40 @@ pub struct EnvRef {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub struct S3BrewDestination {
+    pub stable: S3BrewChannelDestination,
+    pub preview: S3BrewChannelDestination,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3BrewChannelDestination {
     pub prefix: String,
     pub public_base_url: String,
-    pub tap: TapDestination,
+    pub tap: GitIndexDestination,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub struct S3ScoopDestination {
-    pub prefix: String,
-    pub public_base_url: String,
+    pub stable: S3ScoopChannelDestination,
+    pub preview: S3ScoopChannelDestination,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
-pub struct TapDestination {
+pub struct S3ScoopChannelDestination {
+    pub prefix: String,
+    pub public_base_url: String,
+    pub bucket: GitIndexDestination,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct GitIndexDestination {
     pub repository: String,
     pub base_branch: String,
     pub token: EnvRef,
@@ -685,10 +699,17 @@ pub struct TapDestination {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub struct S3DebDestination {
+    pub stable: S3DebChannelDestination,
+    pub preview: S3DebChannelDestination,
+    pub signing: DebSigning,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3DebChannelDestination {
     pub prefix: String,
     pub suite: String,
-    pub signing: DebSigning,
-    pub fingerprint: Option<EnvRef>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -697,12 +718,21 @@ pub struct S3DebDestination {
 pub struct DebSigning {
     pub key: EnvRef,
     pub passphrase: EnvRef,
+    pub fingerprint: EnvRef,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub struct S3RpmDestination {
+    pub stable: S3RpmChannelDestination,
+    pub preview: S3RpmChannelDestination,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub struct S3RpmChannelDestination {
     pub prefix: String,
 }
 
@@ -818,4 +848,151 @@ pub enum LoadReleaseContractError {
     },
     #[snafu(display("invalid release contract"))]
     Invalid { source: ValidateContractError },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReleaseContract;
+
+    fn parse_contract(input: &str) -> Result<ReleaseContract, toml::de::Error> {
+        toml::from_str(input)
+    }
+
+    #[test]
+    fn parses_channel_aware_s3_destinations() {
+        let contract = parse_contract(
+            r#"
+                [package.gmutils]
+                version = "0.8.0-beta.1"
+                description = "Genmeta CLI"
+                license = "Apache-2.0"
+                homepage = "https://www.dhttp.net"
+
+                [package.gmutils.deb]
+                revision = "1"
+                architecture = "target"
+                dockerfile = "xtask/release/deb/Dockerfile"
+
+                [package.gmutils.rpm]
+                release = "1"
+                architecture = "target"
+                dockerfile = "xtask/release/rpm/Dockerfile"
+
+                [package.gmutils.brew]
+                script = "xtask/release/brew/gmutils.sh"
+                manifest_template = "xtask/templates/gmutils.rb.in"
+
+                [package.gmutils.scoop]
+                script = "xtask/release/scoop/gmutils.sh"
+                manifest_template = "xtask/templates/gmutils.json.in"
+
+                [destination.s3]
+                bucket = "download"
+                endpoint.env = "S3_ENDPOINT"
+                access_key_id.env = "S3_ACCESS_KEY_ID"
+                secret_access_key.env = "S3_SECRET_ACCESS_KEY"
+
+                [destination.s3.deb.stable]
+                prefix = "ppa/genmeta"
+                suite = "stable"
+
+                [destination.s3.deb.preview]
+                prefix = "ppa/genmeta"
+                suite = "preview"
+
+                [destination.s3.deb.signing]
+                key.env = "APT_SIGNING_KEY"
+                passphrase.env = "APT_SIGNING_PASSPHRASE"
+                fingerprint.env = "APT_SIGNING_FINGERPRINT"
+
+                [destination.s3.rpm.stable]
+                prefix = "rpm/stable"
+
+                [destination.s3.rpm.preview]
+                prefix = "rpm/preview"
+
+                [destination.s3.brew.stable]
+                prefix = "homebrew/stable"
+                public_base_url = "https://download.dhttp.net/homebrew/stable"
+                tap.repository = "genmeta/homebrew-stable"
+                tap.base_branch = "main"
+                tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+                [destination.s3.brew.preview]
+                prefix = "homebrew/preview"
+                public_base_url = "https://download.dhttp.net/homebrew/preview"
+                tap.repository = "genmeta/homebrew-preview"
+                tap.base_branch = "main"
+                tap.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+                [destination.s3.scoop.stable]
+                prefix = "scoop/stable"
+                public_base_url = "https://download.dhttp.net/scoop/stable"
+                bucket.repository = "genmeta/scoop-stable"
+                bucket.base_branch = "main"
+                bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+
+                [destination.s3.scoop.preview]
+                prefix = "scoop/preview"
+                public_base_url = "https://download.dhttp.net/scoop/preview"
+                bucket.repository = "genmeta/scoop-preview"
+                bucket.base_branch = "main"
+                bucket.token.env = "HOMEBREW_TAP_GITHUB_TOKEN"
+            "#,
+        )
+        .expect("new channel schema should parse");
+
+        contract
+            .validate()
+            .expect("new channel schema should validate");
+        assert_eq!(
+            contract.destination.s3.deb.as_ref().unwrap().stable.suite,
+            "stable"
+        );
+        assert_eq!(
+            contract.destination.s3.deb.as_ref().unwrap().preview.suite,
+            "preview"
+        );
+        assert_eq!(
+            contract.destination.s3.rpm.as_ref().unwrap().stable.prefix,
+            "rpm/stable"
+        );
+        assert_eq!(
+            contract.destination.s3.rpm.as_ref().unwrap().preview.prefix,
+            "rpm/preview"
+        );
+    }
+
+    #[test]
+    fn rejects_old_single_channel_deb_destination_shape() {
+        let error = parse_contract(
+            r#"
+                [package.product]
+                version = "1.2.3"
+                description = "product"
+                license = "Apache-2.0"
+                homepage = "https://example.test"
+
+                [package.product.deb]
+                revision = "1"
+                architecture = "target"
+                dockerfile = "xtask/release/deb/Dockerfile"
+
+                [destination.s3]
+                bucket = "download"
+                endpoint.env = "S3_ENDPOINT"
+                access_key_id.env = "S3_ACCESS_KEY_ID"
+                secret_access_key.env = "S3_SECRET_ACCESS_KEY"
+
+                [destination.s3.deb]
+                prefix = "ppa/genmeta"
+                suite = "genmeta"
+                signing.key.env = "APT_SIGNING_KEY"
+                signing.passphrase.env = "APT_SIGNING_PASSPHRASE"
+            "#,
+        )
+        .expect_err("old schema must be rejected by serde deny_unknown_fields");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
 }

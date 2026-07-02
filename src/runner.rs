@@ -16,8 +16,8 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 use crate::{
     cli::{
-        ParseXtaskCommandRequestError, PublishCommandRequest, XtaskCommandRequest,
-        parse_xtask_command_request_or_exit,
+        ParseXtaskCommandRequestError, PublishCommandRequest, ShowCommandRequest,
+        ShowS3DestinationRequest, XtaskCommandRequest, parse_xtask_command_request_or_exit,
     },
     contract::{PackageBranchRef, ReleaseContract, load_release_contract},
     manifest::{PackageArtifact, PackageManifest, write_package_command_manifest},
@@ -42,6 +42,9 @@ pub fn run_current_dir() -> Result<(), RunCurrentDirError> {
         XtaskCommandRequest::Package(command) => run_package_command(&context, command),
         XtaskCommandRequest::Publish(PublishCommandRequest::S3(command)) => {
             run_s3_publish_command(&context, command)
+        }
+        XtaskCommandRequest::Show(ShowCommandRequest::S3Destination(command)) => {
+            run_show_s3_destination_command(&context, command)
         }
     }
 }
@@ -117,6 +120,72 @@ fn run_s3_publish_command(
         &command,
     )
     .context(run_current_dir_error::RunS3PublishSnafu)
+}
+
+fn run_show_s3_destination_command(
+    context: &RunnerContext,
+    command: ShowS3DestinationRequest,
+) -> Result<(), RunCurrentDirError> {
+    let values = env::vars().collect::<BTreeMap<_, _>>();
+    let package_id = primary_manifest_package(&context.contract)?;
+    let metadata = resolve_metadata(&context.contract, package_id.as_str(), &context.root)
+        .context(run_current_dir_error::ResolveMetadataSnafu {
+            package: package_id.clone(),
+        })?;
+    let channel = crate::channel::ReleaseChannel::from_version(&metadata.source_version);
+    let target = crate::publish::resolve_s3_publish_target(
+        &context.contract,
+        command.system,
+        channel,
+        &values,
+    )
+    .context(run_current_dir_error::ResolveS3DestinationSnafu {
+        system: command.system,
+    })?;
+    let output = s3_destination_output(channel, &target);
+    if command.github_output {
+        print!("{output}");
+    } else {
+        print!("channel={}\n{output}", channel.as_str());
+    }
+    Ok(())
+}
+
+fn s3_destination_output(
+    channel: crate::channel::ReleaseChannel,
+    target: &crate::publish::S3PublishTarget,
+) -> String {
+    match target {
+        crate::publish::S3PublishTarget::Brew(target) => format!(
+            "channel={}\nprefix={}\npublic_base_url={}\nrepository={}\nbase_branch={}\n",
+            channel.as_str(),
+            target.prefix.as_str(),
+            target.public_base_url.as_str(),
+            target.tap.repository,
+            target.tap.base_branch
+        ),
+        crate::publish::S3PublishTarget::Scoop(target) => format!(
+            "channel={}\nprefix={}\npublic_base_url={}\nrepository={}\nbase_branch={}\n",
+            channel.as_str(),
+            target.prefix.as_str(),
+            target.public_base_url.as_str(),
+            target.bucket.repository,
+            target.bucket.base_branch
+        ),
+        crate::publish::S3PublishTarget::Deb(target) => format!(
+            "channel={}\nprefix={}\nsuite={}\n",
+            channel.as_str(),
+            target.prefix.as_str(),
+            target.suite
+        ),
+        crate::publish::S3PublishTarget::Rpm(target) => {
+            format!(
+                "channel={}\nprefix={}\n",
+                channel.as_str(),
+                target.prefix.as_str()
+            )
+        }
+    }
 }
 
 fn primary_source(root: &Path) -> Result<SiblingSource, RunCurrentDirError> {
@@ -986,5 +1055,10 @@ pub enum RunCurrentDirError {
     RunS3Publish {
         #[snafu(source(from(crate::s3::S3PublishError, Box::new)))]
         source: Box<crate::s3::S3PublishError>,
+    },
+    #[snafu(display("failed to resolve s3 {system} destination"))]
+    ResolveS3Destination {
+        source: crate::publish::ResolveS3PublishTargetError,
+        system: PackageSystem,
     },
 }
