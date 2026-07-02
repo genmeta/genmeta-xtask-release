@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 cargo_metadata = "0.21"
+clap = { version = "4", features = ["derive"] }
 debversion = "0.5.2"
 ring = "0.17"
 rpm-version = "0.5.0"

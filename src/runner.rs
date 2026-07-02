@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -16,8 +16,8 @@ use snafu::{OptionExt, ResultExt, Snafu};
 
 use crate::{
     cli::{
-        ParsePackageCommandRequestError, ParseS3PublishCommandRequestError,
-        parse_package_command_request, parse_s3_publish_command_request,
+        ParseXtaskCommandRequestError, PublishCommandRequest, XtaskCommandRequest,
+        parse_xtask_command_request_or_exit,
     },
     contract::{PackageBranchRef, ReleaseContract, load_release_contract},
     manifest::{PackageArtifact, PackageManifest, write_package_command_manifest},
@@ -36,19 +36,13 @@ const WORKSPACE_CONTAINER_PATH: &str = "/workspace";
 pub fn run_current_dir() -> Result<(), RunCurrentDirError> {
     let cwd = env::current_dir().context(run_current_dir_error::CurrentDirSnafu)?;
     let context = RunnerContext::load(cwd)?;
-    let mut args = env::args_os().skip(1).collect::<Vec<_>>();
-    let command = args
-        .first()
-        .and_then(|arg| arg.to_str())
-        .map(ToOwned::to_owned)
-        .ok_or(RunCurrentDirError::MissingCommand)?;
-    let tail = args.split_off(1);
-    match command.as_str() {
-        "package" => run_package_command(&context, &tail),
-        "publish" => run_publish_command(&context, &tail),
-        other => Err(RunCurrentDirError::UnknownCommand {
-            command: other.to_string(),
-        }),
+    let command = parse_xtask_command_request_or_exit(&context.contract, env::args_os())
+        .context(run_current_dir_error::ParseCommandSnafu)?;
+    match command {
+        XtaskCommandRequest::Package(command) => run_package_command(&context, command),
+        XtaskCommandRequest::Publish(PublishCommandRequest::S3(command)) => {
+            run_s3_publish_command(&context, command)
+        }
     }
 }
 
@@ -86,10 +80,8 @@ impl RunnerContext {
 
 fn run_package_command(
     context: &RunnerContext,
-    tokens: &[OsString],
+    command: crate::cli::PackageCommandRequest,
 ) -> Result<(), RunCurrentDirError> {
-    let command = parse_package_command_request(&context.contract, tokens)
-        .context(run_current_dir_error::ParsePackageSnafu)?;
     let values = env::vars().collect::<BTreeMap<_, _>>();
     let primary = primary_source(&context.root)?;
     let units = package_command_invocations_with_primary_source(
@@ -114,29 +106,17 @@ fn run_package_command(
     Ok(())
 }
 
-fn run_publish_command(
+fn run_s3_publish_command(
     context: &RunnerContext,
-    tokens: &[OsString],
+    command: crate::cli::S3PublishCommandRequest,
 ) -> Result<(), RunCurrentDirError> {
-    let Some(subcommand) = tokens.first().and_then(|token| token.to_str()) else {
-        return Err(RunCurrentDirError::MissingPublishCommand);
-    };
-    match subcommand {
-        "s3" => {
-            let command = parse_s3_publish_command_request(&context.contract, &tokens[1..])
-                .context(run_current_dir_error::ParseS3PublishSnafu)?;
-            crate::s3::run(
-                &context.root,
-                &context.target_dir,
-                &context.contract,
-                &command,
-            )
-            .context(run_current_dir_error::RunS3PublishSnafu)
-        }
-        other => Err(RunCurrentDirError::UnknownPublishCommand {
-            command: other.to_string(),
-        }),
-    }
+    crate::s3::run(
+        &context.root,
+        &context.target_dir,
+        &context.contract,
+        &command,
+    )
+    .context(run_current_dir_error::RunS3PublishSnafu)
 }
 
 fn primary_source(root: &Path) -> Result<SiblingSource, RunCurrentDirError> {
@@ -842,13 +822,9 @@ pub enum RunCurrentDirError {
     },
     #[snafu(display("failed to read cargo metadata"))]
     CargoMetadata { source: cargo_metadata::Error },
-    #[snafu(display("xtask command is required"))]
-    MissingCommand,
-    #[snafu(display("unknown xtask command {command}"))]
-    UnknownCommand { command: String },
-    #[snafu(display("failed to parse package command"))]
-    ParsePackage {
-        source: ParsePackageCommandRequestError,
+    #[snafu(display("failed to parse xtask command"))]
+    ParseCommand {
+        source: ParseXtaskCommandRequestError,
     },
     #[snafu(display("failed to plan package command"))]
     PlanPackage {
@@ -1005,14 +981,6 @@ pub enum RunCurrentDirError {
     WriteManifest {
         source: crate::manifest::WritePackageCommandManifestError,
         system: PackageSystem,
-    },
-    #[snafu(display("publish command is required"))]
-    MissingPublishCommand,
-    #[snafu(display("unknown publish command {command}"))]
-    UnknownPublishCommand { command: String },
-    #[snafu(display("failed to parse s3 publish command"))]
-    ParseS3Publish {
-        source: ParseS3PublishCommandRequestError,
     },
     #[snafu(display("failed to run s3 publish command"))]
     RunS3Publish {

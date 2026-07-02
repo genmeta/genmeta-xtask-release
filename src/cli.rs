@@ -1,5 +1,6 @@
 use std::{ffi::OsString, path::PathBuf, str::FromStr};
 
+use clap::{ArgAction, Args, Parser, Subcommand};
 use snafu::{ResultExt, Snafu};
 
 use crate::{
@@ -9,6 +10,176 @@ use crate::{
     },
     system::{PackageSystem, RequestedTarget},
 };
+
+#[derive(Debug, Parser)]
+#[command(name = "xtask", about = "Build & packaging tasks")]
+pub(crate) struct Cli {
+    #[command(subcommand)]
+    command: XtaskCommandCli,
+}
+
+#[derive(Debug, Subcommand)]
+enum XtaskCommandCli {
+    /// Build package artifacts and write package manifests
+    Package(PackageCommandCli),
+    /// Publish package manifests
+    Publish(PublishCommandCli),
+}
+
+#[derive(Debug, Args)]
+struct PackageCommandCli {
+    /// Replace an existing manifest.toml
+    #[arg(long)]
+    overwrite_manifest: bool,
+    /// Grouped package targets: deb/rpm/brew/scoop followed by target-local options
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    targets: Vec<OsString>,
+}
+
+#[derive(Debug, Parser)]
+struct PackageCommandParser {
+    #[command(flatten)]
+    command: PackageCommandCli,
+}
+
+#[derive(Debug, Args)]
+struct PackageSectionCli {
+    /// Target triple or common
+    #[arg(long = "target", required = true, value_parser = parse_requested_target)]
+    targets: Vec<RequestedTarget>,
+    /// Cargo features for this package-system section
+    #[arg(long, value_delimiter = ',', value_parser = parse_feature)]
+    features: Vec<String>,
+    /// Sibling source path, or name=path
+    #[arg(long = "sibling")]
+    siblings: Vec<OsString>,
+    /// Override a Cargo patch source: --patch <source> <package> <sibling/path>
+    #[arg(long = "patch", num_args = 3, action = ArgAction::Append)]
+    patches: Vec<String>,
+    /// Build debug profile instead of release
+    #[arg(long)]
+    debug: bool,
+}
+
+#[derive(Debug, Parser)]
+struct PackageSectionParser {
+    #[command(flatten)]
+    section: PackageSectionCli,
+}
+
+#[derive(Debug, Args)]
+struct PublishCommandCli {
+    #[command(subcommand)]
+    command: PublishSubcommandCli,
+}
+
+#[derive(Debug, Subcommand)]
+enum PublishSubcommandCli {
+    /// Publish package manifests to S3/R2-compatible storage
+    S3(S3PublishCommandCli),
+}
+
+#[derive(Debug, Args)]
+struct S3PublishCommandCli {
+    /// Show upload actions without mutating remote storage
+    #[arg(long)]
+    dry_run: bool,
+    /// Package systems to publish
+    #[arg(required = true, value_parser = parse_package_system)]
+    systems: Vec<PackageSystem>,
+}
+
+#[derive(Debug, Parser)]
+struct S3PublishCommandParser {
+    #[command(flatten)]
+    command: S3PublishCommandCli,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XtaskCommandRequest {
+    Package(PackageCommandRequest),
+    Publish(PublishCommandRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishCommandRequest {
+    S3(S3PublishCommandRequest),
+}
+
+pub fn parse_xtask_command_request<I, T>(
+    contract: &ReleaseContract,
+    tokens: I,
+) -> Result<XtaskCommandRequest, ParseXtaskCommandRequestError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(tokens).context(parse_xtask_command_request_error::ClapSnafu)?;
+    match cli.command {
+        XtaskCommandCli::Package(command) => package_command_request(contract, command)
+            .map(XtaskCommandRequest::Package)
+            .context(parse_xtask_command_request_error::PackageSnafu),
+        XtaskCommandCli::Publish(command) => publish_command_request(contract, command)
+            .map(XtaskCommandRequest::Publish)
+            .context(parse_xtask_command_request_error::PublishSnafu),
+    }
+}
+
+pub fn parse_xtask_command_request_or_exit<I, T>(
+    contract: &ReleaseContract,
+    tokens: I,
+) -> Result<XtaskCommandRequest, ParseXtaskCommandRequestError>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(tokens).unwrap_or_else(|error| error.exit());
+    match cli.command {
+        XtaskCommandCli::Package(command) => package_command_request(contract, command)
+            .map(XtaskCommandRequest::Package)
+            .context(parse_xtask_command_request_error::PackageSnafu),
+        XtaskCommandCli::Publish(command) => publish_command_request(contract, command)
+            .map(XtaskCommandRequest::Publish)
+            .context(parse_xtask_command_request_error::PublishSnafu),
+    }
+}
+
+fn publish_command_request(
+    contract: &ReleaseContract,
+    command: PublishCommandCli,
+) -> Result<PublishCommandRequest, ParseS3PublishCommandRequestError> {
+    match command.command {
+        PublishSubcommandCli::S3(command) => {
+            s3_publish_command_request(contract, command).map(PublishCommandRequest::S3)
+        }
+    }
+}
+
+fn parse_package_system(value: &str) -> Result<PackageSystem, String> {
+    PackageSystem::from_str(value).map_err(|error| error.to_string())
+}
+
+fn parse_feature(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("feature must not be empty".to_string());
+    }
+    Ok(value.to_string())
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ParseXtaskCommandRequestError {
+    #[snafu(display("failed to parse command line"))]
+    Clap { source: clap::Error },
+    #[snafu(display("failed to parse package command"))]
+    Package {
+        source: ParsePackageCommandRequestError,
+    },
+    #[snafu(display("failed to parse publish command"))]
+    Publish {
+        source: ParseS3PublishCommandRequestError,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageSystemSection {
@@ -74,37 +245,21 @@ pub fn parse_package_command_request(
     contract: &ReleaseContract,
     tokens: &[OsString],
 ) -> Result<PackageCommandRequest, ParsePackageCommandRequestError> {
-    let mut overwrite_manifest = false;
-    let mut index = 0;
-    while index < tokens.len() {
-        let Some(option) = tokens[index].to_str() else {
-            return Err(ParsePackageCommandRequestError::OptionNotUtf8);
-        };
-        if !option.starts_with('-') {
-            break;
-        }
-        match option {
-            "--overwrite-manifest" => {
-                overwrite_manifest = true;
-                index += 1;
-            }
-            other if other.starts_with('-') => {
-                return Err(ParsePackageCommandRequestError::UnknownOption {
-                    option: other.to_string(),
-                });
-            }
-            other => {
-                return Err(ParsePackageCommandRequestError::UnexpectedArgument {
-                    argument: other.to_string(),
-                });
-            }
-        }
-    }
+    let command = PackageCommandParser::try_parse_from(
+        std::iter::once(OsString::from("package")).chain(tokens.iter().cloned()),
+    )
+    .context(parse_package_command_request_error::ClapSnafu)?;
+    package_command_request(contract, command.command)
+}
 
-    let builds = parse_package_build_requests(contract, &tokens[index..])
+fn package_command_request(
+    contract: &ReleaseContract,
+    command: PackageCommandCli,
+) -> Result<PackageCommandRequest, ParsePackageCommandRequestError> {
+    let builds = parse_package_build_requests(contract, &command.targets)
         .context(parse_package_command_request_error::BuildRequestsSnafu)?;
     Ok(PackageCommandRequest {
-        overwrite_manifest,
+        overwrite_manifest: command.overwrite_manifest,
         builds,
     })
 }
@@ -187,102 +342,33 @@ pub enum PackageSectionOverlayError {
 pub fn parse_package_section_args(
     tokens: &[OsString],
 ) -> Result<PackageSectionArgs, ParsePackageSectionArgsError> {
-    let mut args = PackageSectionArgs {
-        targets: Vec::new(),
-        features: Vec::new(),
-        siblings: Vec::new(),
-        sibling_sources: Vec::new(),
-        patches: Vec::new(),
-        debug: false,
-    };
-    let mut index = 0;
-    while index < tokens.len() {
-        let Some(option) = tokens[index].to_str() else {
-            return Err(ParsePackageSectionArgsError::OptionNotUtf8);
-        };
-        match option {
-            "--target" => {
-                let value = package_section_value(tokens, index, option)?;
-                args.targets.push(parse_requested_target(value)?);
-                index += 2;
-            }
-            "--features" => {
-                let value = package_section_value(tokens, index, option)?;
-                for feature in value.split(',') {
-                    if feature.is_empty() {
-                        return Err(ParsePackageSectionArgsError::EmptyFeature);
-                    }
-                    args.features.push(feature.to_string());
-                }
-                index += 2;
-            }
-            "--sibling" => {
-                let value = package_section_os_value(tokens, index, option)?;
-                args.siblings.push(PathBuf::from(value));
-                if let Some(source) = parse_sibling_source(value)? {
-                    args.sibling_sources.push(source);
-                }
-                index += 2;
-            }
-            "--patch" => {
-                let source = package_section_value(tokens, index, option)?;
-                let package = package_section_value(tokens, index + 1, option)?;
-                let sibling_path = package_section_value(tokens, index + 2, option)?;
-                args.patches
-                    .push(parse_patch_override(source, package, sibling_path)?);
-                index += 4;
-            }
-            "--debug" => {
-                args.debug = true;
-                index += 1;
-            }
-            other if other.starts_with('-') => {
-                return Err(ParsePackageSectionArgsError::UnknownOption {
-                    option: other.to_string(),
-                });
-            }
-            other => {
-                return Err(ParsePackageSectionArgsError::UnexpectedArgument {
-                    argument: other.to_string(),
-                });
-            }
+    let cli = PackageSectionParser::try_parse_from(
+        std::iter::once(OsString::from("package-section")).chain(tokens.iter().cloned()),
+    )
+    .context(parse_package_section_args_error::ClapSnafu)?;
+    let mut sibling_sources = Vec::new();
+    for sibling in &cli.section.siblings {
+        if let Some(source) = parse_sibling_source(sibling)? {
+            sibling_sources.push(source);
         }
     }
-
-    if args.targets.is_empty() {
-        return Err(ParsePackageSectionArgsError::MissingTarget);
+    let mut patches = Vec::new();
+    for patch in cli.section.patches.chunks_exact(3) {
+        patches.push(parse_patch_override(&patch[0], &patch[1], &patch[2])?);
     }
-    Ok(args)
-}
-
-fn package_section_os_value<'a>(
-    tokens: &'a [OsString],
-    index: usize,
-    option: &str,
-) -> Result<&'a OsString, ParsePackageSectionArgsError> {
-    tokens
-        .get(index + 1)
-        .ok_or_else(|| ParsePackageSectionArgsError::MissingOptionValue {
-            option: option.to_string(),
-        })
-}
-
-fn package_section_value<'a>(
-    tokens: &'a [OsString],
-    index: usize,
-    option: &str,
-) -> Result<&'a str, ParsePackageSectionArgsError> {
-    let value =
-        tokens
-            .get(index + 1)
-            .ok_or_else(|| ParsePackageSectionArgsError::MissingOptionValue {
-                option: option.to_string(),
-            })?;
-    value
-        .to_str()
-        .ok_or(ParsePackageSectionArgsError::OptionValueNotUtf8 {
-            option: option.to_string(),
-        })
+    Ok(PackageSectionArgs {
+        targets: cli.section.targets,
+        features: cli.section.features,
+        siblings: cli
+            .section
+            .siblings
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+        sibling_sources,
+        patches,
+        debug: cli.section.debug,
+    })
 }
 
 fn parse_sibling_source(
@@ -371,6 +457,8 @@ pub enum ParsePackageSystemSectionsError {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ParsePackageSectionArgsError {
+    #[snafu(display("failed to parse package section arguments"))]
+    Clap { source: clap::Error },
     #[snafu(display("package section option must be utf-8"))]
     OptionNotUtf8,
     #[snafu(display("package section option {option} requires a value"))]
@@ -398,6 +486,8 @@ pub enum ParsePackageSectionArgsError {
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ParsePackageCommandRequestError {
+    #[snafu(display("failed to parse package command arguments"))]
+    Clap { source: clap::Error },
     #[snafu(display("package command option must be utf-8"))]
     OptionNotUtf8,
     #[snafu(display("unknown package command option {option}"))]
@@ -464,31 +554,38 @@ pub fn parse_s3_publish_command_request(
     contract: &ReleaseContract,
     tokens: &[OsString],
 ) -> Result<S3PublishCommandRequest, ParseS3PublishCommandRequestError> {
-    let mut dry_run = false;
-    let mut index = 0;
-    while index < tokens.len() {
-        let Some(option) = tokens[index].to_str() else {
-            return Err(ParseS3PublishCommandRequestError::OptionNotUtf8);
-        };
-        if !option.starts_with('-') {
-            break;
+    let command = S3PublishCommandParser::try_parse_from(
+        std::iter::once(OsString::from("s3")).chain(tokens.iter().cloned()),
+    )
+    .context(parse_s3_publish_command_request_error::ClapSnafu)?;
+    s3_publish_command_request(contract, command.command)
+}
+
+fn s3_publish_command_request(
+    contract: &ReleaseContract,
+    command: S3PublishCommandCli,
+) -> Result<S3PublishCommandRequest, ParseS3PublishCommandRequestError> {
+    validate_s3_publish_systems(contract, &command.systems)
+        .context(parse_s3_publish_command_request_error::PublishRequestsSnafu)?;
+    Ok(S3PublishCommandRequest {
+        dry_run: command.dry_run,
+        systems: command.systems,
+    })
+}
+
+fn validate_s3_publish_systems(
+    contract: &ReleaseContract,
+    systems: &[PackageSystem],
+) -> Result<(), ParseS3PublishRequestsError> {
+    for &system in systems {
+        if !destination_has_s3_package_system(contract, system) {
+            return Err(ParseS3PublishRequestsError::UndefinedDestinationBranch { system });
         }
-        match option {
-            "--dry-run" => {
-                dry_run = true;
-                index += 1;
-            }
-            other => {
-                return Err(ParseS3PublishCommandRequestError::UnknownOption {
-                    option: other.to_string(),
-                });
-            }
+        if !contract_has_package_system(contract, system) {
+            return Err(ParseS3PublishRequestsError::UndefinedPackageSystem { system });
         }
     }
-
-    let systems = parse_s3_publish_requests(contract, &tokens[index..])
-        .context(parse_s3_publish_command_request_error::PublishRequestsSnafu)?;
-    Ok(S3PublishCommandRequest { dry_run, systems })
+    Ok(())
 }
 
 fn destination_has_s3_package_system(contract: &ReleaseContract, system: PackageSystem) -> bool {
@@ -503,6 +600,8 @@ fn destination_has_s3_package_system(contract: &ReleaseContract, system: Package
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ParseS3PublishCommandRequestError {
+    #[snafu(display("failed to parse s3 publish command arguments"))]
+    Clap { source: clap::Error },
     #[snafu(display("s3 publish command option must be utf-8"))]
     OptionNotUtf8,
     #[snafu(display("unknown s3 publish command option {option}"))]
@@ -524,4 +623,129 @@ pub enum ParseS3PublishRequestsError {
     TargetLocalArguments { system: PackageSystem },
     #[snafu(display("package system {system} is not defined by any package branch"))]
     UndefinedPackageSystem { system: PackageSystem },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use clap::Parser;
+
+    use super::{parse_package_command_request, parse_s3_publish_command_request};
+    use crate::{contract::ReleaseContract, system::RequestedTarget};
+
+    fn contract() -> ReleaseContract {
+        let contract: ReleaseContract = toml::from_str(
+            r#"
+                [package.product]
+                version = "1.2.3"
+                description = "test product"
+                license = "Apache-2.0"
+                homepage = "https://example.test"
+
+                [package.product.rpm]
+                release = "1"
+                architecture = "target"
+                dockerfile = "xtask/release/rpm/Dockerfile"
+
+                [package.product.deb]
+                revision = "1"
+                architecture = "target"
+                dockerfile = "xtask/release/deb/Dockerfile"
+
+                [destination.s3]
+                bucket = "release"
+                endpoint.env = "S3_ENDPOINT"
+                access_key_id.env = "S3_ACCESS_KEY_ID"
+                secret_access_key.env = "S3_SECRET_ACCESS_KEY"
+
+                [destination.s3.rpm]
+                prefix = "rpm/product"
+
+                [destination.s3.deb]
+                prefix = "deb/product"
+                suite = "stable"
+                signing.key.env = "APT_SIGNING_KEY"
+                signing.passphrase.env = "APT_SIGNING_PASSPHRASE"
+            "#,
+        )
+        .expect("fixture contract should parse");
+        contract
+            .validate()
+            .expect("fixture contract should validate");
+        contract
+    }
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn top_level_help_is_generated_by_clap() {
+        let error =
+            super::Cli::try_parse_from(["xtask", "--help"]).expect_err("help should exit early");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(error.to_string().contains("Build & packaging tasks"));
+    }
+
+    #[test]
+    fn package_command_uses_clap_for_grouped_package_sections() {
+        let command = parse_package_command_request(
+            &contract(),
+            &os_args(&[
+                "--overwrite-manifest",
+                "rpm",
+                "--target",
+                "common",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--features",
+                "sshd,pam",
+                "--sibling",
+                "dhttp=../dhttp",
+                "--patch",
+                "crates-io",
+                "dhttp",
+                "dhttp/dhttp",
+            ]),
+        )
+        .expect("package command should parse");
+
+        assert!(command.overwrite_manifest);
+        assert_eq!(command.builds.len(), 1);
+        let build = &command.builds[0];
+        assert_eq!(
+            build.args.targets,
+            vec![
+                RequestedTarget::Common,
+                RequestedTarget::Triple("x86_64-unknown-linux-gnu".to_string())
+            ]
+        );
+        assert_eq!(build.args.features, vec!["sshd", "pam"]);
+        assert_eq!(build.args.sibling_sources[0].name, "dhttp");
+        assert_eq!(build.args.patches[0].package, "dhttp");
+    }
+
+    #[test]
+    fn package_section_rejects_unknown_options_with_clap() {
+        let error = parse_package_command_request(
+            &contract(),
+            &os_args(&["rpm", "--target", "x86_64-unknown-linux-gnu", "--unknown"]),
+        )
+        .expect_err("unknown package section option should fail");
+
+        let report = snafu::Report::from_error(&error).to_string();
+        assert!(report.contains("unexpected argument '--unknown'"));
+    }
+
+    #[test]
+    fn s3_publish_command_uses_clap_for_flags_and_systems() {
+        let command =
+            parse_s3_publish_command_request(&contract(), &os_args(&["--dry-run", "deb", "rpm"]))
+                .expect("s3 publish command should parse");
+
+        assert!(command.dry_run);
+        assert_eq!(command.systems.len(), 2);
+    }
 }

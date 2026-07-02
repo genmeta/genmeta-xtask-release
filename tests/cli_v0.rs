@@ -211,10 +211,9 @@ fn package_section_args_require_targets() {
         genmeta_xtask_release::cli::parse_package_section_args(&[os("--features"), os("sshd")])
             .expect_err("missing targets should fail");
 
-    assert_eq!(
-        error.to_string(),
-        "package section requires at least one target"
-    );
+    let report = snafu::Report::from_error(&error).to_string();
+    assert!(report.contains("required"));
+    assert!(report.contains("--target"));
 }
 
 #[test]
@@ -226,10 +225,8 @@ fn package_section_args_reject_unknown_option() {
     ])
     .expect_err("unknown package section option should fail");
 
-    assert_eq!(
-        error.to_string(),
-        "unknown package section option --install-pam"
-    );
+    let report = snafu::Report::from_error(&error).to_string();
+    assert!(report.contains("unexpected argument '--install-pam'"));
 }
 
 #[test]
@@ -359,10 +356,8 @@ fn package_command_request_rejects_unknown_global_option() {
     )
     .expect_err("unknown global package option should fail");
 
-    assert_eq!(
-        error.to_string(),
-        "unknown package command option --dry-run"
-    );
+    let report = snafu::Report::from_error(&error).to_string();
+    assert!(report.contains("expected a package system before argument --dry-run"));
 }
 
 #[test]
@@ -541,10 +536,8 @@ fn s3_publish_command_request_rejects_unknown_global_option() {
     )
     .expect_err("unknown s3 publish command option should fail");
 
-    assert_eq!(
-        error.to_string(),
-        "unknown s3 publish command option --overwrite-manifest"
-    );
+    let report = snafu::Report::from_error(&error).to_string();
+    assert!(report.contains("unexpected argument '--overwrite-manifest'"));
 }
 
 #[test]
