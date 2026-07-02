@@ -39,8 +39,12 @@ pub fn run_current_dir() -> Result<(), RunCurrentDirError> {
     let command = parse_xtask_command_request_or_exit(&context.contract, env::args_os())
         .context(run_current_dir_error::ParseCommandSnafu)?;
     match command {
-        XtaskCommandRequest::Package(command) => run_package_command(&context, command),
+        XtaskCommandRequest::Package(command) => {
+            let context = context.with_target_dir()?;
+            run_package_command(&context, command)
+        }
         XtaskCommandRequest::Publish(PublishCommandRequest::S3(command)) => {
+            let context = context.with_target_dir()?;
             run_s3_publish_command(&context, command)
         }
         XtaskCommandRequest::Show(ShowCommandRequest::S3Destination(command)) => {
@@ -52,7 +56,7 @@ pub fn run_current_dir() -> Result<(), RunCurrentDirError> {
 struct RunnerContext {
     root: PathBuf,
     contract: ReleaseContract,
-    target_dir: PathBuf,
+    target_dir: Option<PathBuf>,
 }
 
 impl RunnerContext {
@@ -63,21 +67,32 @@ impl RunnerContext {
                 path: contract_path,
             },
         )?;
+        Ok(Self {
+            root,
+            contract,
+            target_dir: None,
+        })
+    }
+
+    fn with_target_dir(mut self) -> Result<Self, RunCurrentDirError> {
         let target_dir = cargo_metadata::MetadataCommand::new()
-            .current_dir(&root)
+            .current_dir(&self.root)
             .exec()
             .context(run_current_dir_error::CargoMetadataSnafu)?
             .target_directory
             .into_std_path_buf();
-        Ok(Self {
-            root,
-            contract,
-            target_dir,
-        })
+        self.target_dir = Some(target_dir);
+        Ok(self)
     }
 
     fn contract_root(&self) -> &Path {
         &self.root
+    }
+
+    fn target_dir(&self) -> &Path {
+        self.target_dir
+            .as_deref()
+            .expect("package and publish commands should resolve target directory")
     }
 }
 
@@ -103,8 +118,13 @@ fn run_package_command(
 
     for (system, artifacts) in artifacts {
         let manifest = package_manifest(context, system, artifacts)?;
-        write_package_command_manifest(&context.target_dir, &manifest, &context.contract, &command)
-            .context(run_current_dir_error::WriteManifestSnafu { system })?;
+        write_package_command_manifest(
+            context.target_dir(),
+            &manifest,
+            &context.contract,
+            &command,
+        )
+        .context(run_current_dir_error::WriteManifestSnafu { system })?;
     }
     Ok(())
 }
@@ -115,7 +135,7 @@ fn run_s3_publish_command(
 ) -> Result<(), RunCurrentDirError> {
     crate::s3::run(
         &context.root,
-        &context.target_dir,
+        context.target_dir(),
         &context.contract,
         &command,
     )
@@ -203,7 +223,7 @@ fn run_package_unit(
     context: &RunnerContext,
     unit: &PlannedPackageUnit,
 ) -> Result<PackageArtifact, RunCurrentDirError> {
-    let output_dir = package_output_dir(&context.target_dir, unit);
+    let output_dir = package_output_dir(context.target_dir(), unit);
     if output_dir.exists() {
         remove_artifacts_in(&output_dir, unit.system)?;
     }
@@ -256,7 +276,7 @@ fn run_package_unit(
             )?;
         }
     }
-    artifact_from_output_dir(unit, &context.target_dir, &output_dir)
+    artifact_from_output_dir(unit, context.target_dir(), &output_dir)
 }
 
 fn package_output_dir(target_dir: &Path, unit: &PlannedPackageUnit) -> PathBuf {
@@ -278,7 +298,7 @@ fn package_output_dir(target_dir: &Path, unit: &PlannedPackageUnit) -> PathBuf {
 fn package_env_target_dir(context: &RunnerContext, unit: &PlannedPackageUnit) -> String {
     match &unit.invocation.executor {
         PlannedPackageExecutor::LocalScript { .. } => {
-            context.target_dir.to_string_lossy().into_owned()
+            context.target_dir().to_string_lossy().into_owned()
         }
         PlannedPackageExecutor::DockerImage { .. } => {
             format!("{WORKSPACE_CONTAINER_PATH}/target")
@@ -295,7 +315,7 @@ fn package_env_output_dir(
         PlannedPackageExecutor::LocalScript { .. } => output_dir.to_string_lossy().into_owned(),
         PlannedPackageExecutor::DockerImage { .. } => {
             let relative = output_dir
-                .strip_prefix(&context.target_dir)
+                .strip_prefix(context.target_dir())
                 .unwrap_or(output_dir);
             Path::new(WORKSPACE_CONTAINER_PATH)
                 .join("target")
@@ -464,7 +484,9 @@ fn run_docker_package(
                 if mount.read_only { ":ro" } else { "" }
             ));
         }
-        let cargo_config = context.target_dir.join(".genmeta-xtask-release-cargo.toml");
+        let cargo_config = context
+            .target_dir()
+            .join(".genmeta-xtask-release-cargo.toml");
         fs::write(&cargo_config, &overlay.cargo_config).context(
             run_current_dir_error::WriteCargoConfigSnafu {
                 path: cargo_config.clone(),
