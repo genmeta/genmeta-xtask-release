@@ -418,8 +418,10 @@ pub fn parse_package_section_args(
         }
     }
     let mut patches = Vec::new();
-    for patch in cli.section.patches.chunks_exact(3) {
-        patches.push(parse_patch_override(&patch[0], &patch[1], &patch[2])?);
+    let (patch_args, remainder) = cli.section.patches.as_chunks::<3>();
+    debug_assert!(remainder.is_empty());
+    for [source, package, sibling_path] in patch_args {
+        patches.push(parse_patch_override(source, package, sibling_path)?);
     }
     Ok(PackageSectionArgs {
         targets: cli.section.targets,

@@ -249,6 +249,14 @@ struct S3Client {
     secret_access_key: String,
 }
 
+struct S3PublishContext<'a> {
+    root: &'a Path,
+    target_dir: &'a Path,
+    contract: &'a ReleaseContract,
+    options: &'a S3Options,
+    client: &'a S3Client,
+}
+
 #[derive(Debug, Clone)]
 struct S3Response {
     status: u16,
@@ -299,18 +307,19 @@ fn run_inner(
             target_summary(&target)
         );
         let client = s3_client(target.common())?;
+        let publish_context = S3PublishContext {
+            root,
+            target_dir,
+            contract,
+            options: &options,
+            client: &client,
+        };
         match target {
             S3PublishTarget::Brew(target) => {
-                publish_brew(
-                    root, target_dir, contract, &options, &client, target, package_id, metadata,
-                    manifest,
-                )?;
+                publish_brew(&publish_context, target, package_id, metadata, manifest)?;
             }
             S3PublishTarget::Scoop(target) => {
-                publish_scoop(
-                    root, target_dir, contract, &options, &client, target, package_id, metadata,
-                    manifest,
-                )?;
+                publish_scoop(&publish_context, target, package_id, metadata, manifest)?;
             }
             S3PublishTarget::Deb(target) => {
                 publish_deb(target_dir, &options, &client, target, manifest)?;
@@ -366,24 +375,25 @@ fn target_summary(target: &S3PublishTarget) -> String {
 }
 
 fn publish_brew(
-    root: &Path,
-    target_dir: &Path,
-    contract: &ReleaseContract,
-    options: &S3Options,
-    client: &S3Client,
+    context: &S3PublishContext<'_>,
     target: S3BrewPublishTarget,
     package_id: PackageId,
     metadata: crate::package::ResolvedPackageMetadata,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
     let (mut uploads, manifest) = plan_versioned_archive_uploads(
-        target_dir,
-        client,
+        context.target_dir,
+        context.client,
         target.common.bucket.as_str(),
         &target.prefix,
         manifest,
     )?;
-    let template = manifest_template(root, contract, &package_id, PackageSystem::Brew)?;
+    let template = manifest_template(
+        context.root,
+        context.contract,
+        &package_id,
+        PackageSystem::Brew,
+    )?;
     let variables =
         brew_template_variables(&package_id, &metadata, &manifest, &target.public_base_url)
             .context(s3_publish_error::BuildBrewTemplateVariablesSnafu)?;
@@ -391,7 +401,7 @@ fn publish_brew(
         render_template(&template, &variables).context(s3_publish_error::RenderTemplateSnafu)?;
     let names = mutable_entry_names(&package_id, PackageSystem::Brew, &metadata.source_version)
         .context(s3_publish_error::MutableEntryNamesSnafu)?;
-    let out_dir = target_dir.join("common").join("brew");
+    let out_dir = context.target_dir.join("common").join("brew");
     fs::create_dir_all(&out_dir).context(s3_publish_error::CreatePublishDirSnafu {
         path: out_dir.clone(),
     })?;
@@ -415,28 +425,34 @@ fn publish_brew(
         entry: true,
         condition: None,
     });
-    publish_uploads(options, client, target.common.bucket.as_str(), uploads)
+    publish_uploads(
+        context.options,
+        context.client,
+        target.common.bucket.as_str(),
+        uploads,
+    )
 }
 
 fn publish_scoop(
-    root: &Path,
-    target_dir: &Path,
-    contract: &ReleaseContract,
-    options: &S3Options,
-    client: &S3Client,
+    context: &S3PublishContext<'_>,
     target: S3ScoopPublishTarget,
     package_id: PackageId,
     metadata: crate::package::ResolvedPackageMetadata,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
     let (mut uploads, manifest) = plan_versioned_archive_uploads(
-        target_dir,
-        client,
+        context.target_dir,
+        context.client,
         target.common.bucket.as_str(),
         &target.prefix,
         manifest,
     )?;
-    let template = manifest_template(root, contract, &package_id, PackageSystem::Scoop)?;
+    let template = manifest_template(
+        context.root,
+        context.contract,
+        &package_id,
+        PackageSystem::Scoop,
+    )?;
     let variables = crate::scoop::scoop_template_variables(
         &package_id,
         &metadata,
@@ -449,7 +465,7 @@ fn publish_scoop(
         render_template(&template, &variables).context(s3_publish_error::RenderTemplateSnafu)?;
     let names = mutable_entry_names(&package_id, PackageSystem::Scoop, &metadata.source_version)
         .context(s3_publish_error::MutableEntryNamesSnafu)?;
-    let out_dir = target_dir.join("common").join("scoop");
+    let out_dir = context.target_dir.join("common").join("scoop");
     fs::create_dir_all(&out_dir).context(s3_publish_error::CreatePublishDirSnafu {
         path: out_dir.clone(),
     })?;
@@ -473,7 +489,12 @@ fn publish_scoop(
         entry: true,
         condition: None,
     });
-    publish_uploads(options, client, target.common.bucket.as_str(), uploads)
+    publish_uploads(
+        context.options,
+        context.client,
+        target.common.bucket.as_str(),
+        uploads,
+    )
 }
 
 fn plan_versioned_archive_uploads(

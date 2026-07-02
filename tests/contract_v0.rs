@@ -845,10 +845,10 @@ prefix = "homebrew"
 }
 
 #[test]
-fn package_root_version_must_not_be_package_system_version() {
+fn package_root_version_accepts_semver_prerelease() {
     let input = r#"
 [package.pishoo-common]
-version = "0.5.1-1"
+version = "0.5.1-beta.1"
 description = "Common files for pishoo"
 license = "Apache-2.0"
 homepage = "https://dhttp.net"
@@ -866,10 +866,9 @@ secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
 "#;
 
     let contract: ReleaseContract = toml::from_str(input).expect("contract should parse");
-    let error = contract
+    contract
         .validate()
-        .expect_err("root package-system version should fail");
-    assert!(error.to_string().contains("source version"));
+        .expect("semver prerelease source version should validate");
 }
 
 #[test]
@@ -3398,7 +3397,7 @@ fn load_release_contract_rejects_invalid_contract_file() {
         &path,
         r#"
 [package.invalid]
-version = "1.2.3-1"
+version = "1.2.3_1"
 description = "Invalid"
 license = "Apache-2.0"
 homepage = "https://dhttp.net"
