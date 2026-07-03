@@ -326,7 +326,6 @@ pub fn remote_deb_payload_version_from_key(
         parts.len() == 5 && parts[0] == "pool" && parts[1] == "main",
         remote_deb_payload_version_from_key_error::UnexpectedLayoutSnafu { key }
     );
-    let package = parts[3];
     let archive_name = parts[4];
     let stem = archive_name
         .strip_suffix(".deb")
@@ -334,9 +333,8 @@ pub fn remote_deb_payload_version_from_key(
     let (package_and_version, architecture) = stem
         .rsplit_once('_')
         .context(remote_deb_payload_version_from_key_error::MissingDebFilenameSnafu { key })?;
-    let version = package_and_version
-        .strip_prefix(package)
-        .and_then(|value| value.strip_prefix('_'))
+    let (package, version) = package_and_version
+        .split_once('_')
         .context(remote_deb_payload_version_from_key_error::MissingDebFilenameSnafu { key })?;
     Ok(LinuxPackageVersion {
         package: package.to_string(),

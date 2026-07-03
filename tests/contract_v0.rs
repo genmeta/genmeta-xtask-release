@@ -2486,6 +2486,22 @@ fn remote_deb_payload_version_from_key_uses_pool_layout() {
 }
 
 #[test]
+fn remote_deb_payload_version_from_key_uses_binary_package_filename() {
+    let prefix = genmeta_xtask_release::publish::RemotePrefix::parse("ppa/genmeta")
+        .expect("prefix should parse");
+
+    let version = genmeta_xtask_release::publish::remote_deb_payload_version_from_key(
+        &prefix,
+        "ppa/genmeta/pool/main/p/pishoo/pishoo-common_0.5.0-1_all.deb",
+    )
+    .expect("remote deb payload version should parse");
+
+    assert_eq!(version.package, "pishoo-common");
+    assert_eq!(version.version, "0.5.0-1");
+    assert_eq!(version.architecture, "all");
+}
+
+#[test]
 fn remote_deb_payload_version_from_key_rejects_unexpected_layout() {
     let prefix = genmeta_xtask_release::publish::RemotePrefix::parse("apt/sample")
         .expect("prefix should parse");
