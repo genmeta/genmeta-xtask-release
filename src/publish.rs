@@ -170,6 +170,26 @@ pub fn remote_deb_package_entries_from_packages(
     Ok(entries)
 }
 
+pub fn remote_deb_package_entries_from_keys<'a>(
+    prefix: &RemotePrefix,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<RemoteDebPackageEntry>, RemoteDebPackageEntriesFromKeysError> {
+    let mut entries = Vec::new();
+    for key in keys {
+        let version = remote_deb_payload_version_from_key(prefix, key)
+            .context(remote_deb_package_entries_from_keys_error::VersionSnafu)?;
+        let filename = key
+            .strip_prefix(prefix.as_str())
+            .and_then(|value| value.strip_prefix('/'))
+            .context(remote_deb_package_entries_from_keys_error::UnexpectedLayoutSnafu { key })?;
+        entries.push(RemoteDebPackageEntry {
+            version,
+            filename: filename.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 fn deb_stanza_field(stanza: &str, name: &'static str) -> Option<String> {
     let prefix = format!("{name}:");
     stanza.lines().find_map(|line| {
@@ -183,6 +203,17 @@ fn deb_stanza_field(stanza: &str, name: &'static str) -> Option<String> {
 pub enum RemoteDebPackageEntriesFromPackagesError {
     #[snafu(display("remote deb package stanza is missing {field}"))]
     MissingField { field: &'static str },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum RemoteDebPackageEntriesFromKeysError {
+    #[snafu(display("failed to parse remote deb payload version"))]
+    Version {
+        source: RemoteDebPayloadVersionFromKeyError,
+    },
+    #[snafu(display("remote deb payload key {key} has unexpected layout"))]
+    UnexpectedLayout { key: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +575,41 @@ where
         .context(publishable_deb_payloads_from_manifest_and_packages_error::CompareVersionsSnafu)
 }
 
+pub fn publishable_deb_payloads_from_manifest_packages_and_remote_keys<'a, 'b, E>(
+    manifest: &PackageManifest,
+    packages_contents: impl IntoIterator<Item = &'a str>,
+    prefix: &RemotePrefix,
+    remote_keys: impl IntoIterator<Item = &'b str>,
+    compare_versions: impl Fn(&str, &str) -> Result<Ordering, E>,
+) -> Result<Vec<LinuxPackagePayload>, PublishableDebPayloadsFromManifestPackagesAndRemoteKeysError<E>>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ensure!(
+        manifest.kind == PackageSystem::Deb,
+        publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::WrongKindSnafu {
+            system: manifest.kind
+        }
+    );
+    let local_payloads = linux_package_payloads_from_manifest(manifest).context(
+        publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::LocalPayloadsSnafu,
+    )?;
+    let mut remote_versions = Vec::new();
+    for content in packages_contents {
+        let entries = remote_deb_package_entries_from_packages(content).context(
+            publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::RemotePackagesSnafu,
+        )?;
+        remote_versions.extend(entries.into_iter().map(|entry| entry.version));
+    }
+    let entries = remote_deb_package_entries_from_keys(prefix, remote_keys).context(
+        publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::RemoteKeysSnafu,
+    )?;
+    remote_versions.extend(entries.into_iter().map(|entry| entry.version));
+    select_publishable_linux_payloads(local_payloads, &remote_versions, compare_versions).context(
+        publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::CompareVersionsSnafu,
+    )
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum PublishableDebPayloadsFromManifestAndPackagesError<E>
@@ -559,6 +625,30 @@ where
     #[snafu(display("failed to read remote deb package entries"))]
     RemotePackages {
         source: RemoteDebPackageEntriesFromPackagesError,
+    },
+    #[snafu(display("failed to select publishable deb payloads"))]
+    CompareVersions { source: E },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum PublishableDebPayloadsFromManifestPackagesAndRemoteKeysError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    #[snafu(display("{system} package manifest is not a deb package manifest"))]
+    WrongKind { system: PackageSystem },
+    #[snafu(display("failed to read deb package payloads from manifest"))]
+    LocalPayloads {
+        source: LinuxPackagePayloadsFromManifestError,
+    },
+    #[snafu(display("failed to read remote deb package entries"))]
+    RemotePackages {
+        source: RemoteDebPackageEntriesFromPackagesError,
+    },
+    #[snafu(display("failed to read remote deb package payload keys"))]
+    RemoteKeys {
+        source: RemoteDebPackageEntriesFromKeysError,
     },
     #[snafu(display("failed to select publishable deb payloads"))]
     CompareVersions { source: E },

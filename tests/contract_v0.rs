@@ -2895,6 +2895,34 @@ fn publishable_deb_payloads_from_manifest_and_packages_selects_candidates_once()
 }
 
 #[test]
+fn publishable_deb_payloads_consider_remote_pool_payload_versions() {
+    let manifest = linux_manifest(
+        PackageSystem::Deb,
+        vec![
+            linux_artifact("sample", "1.2.4-1", "amd64"),
+            linux_artifact("sample-common", "1.2.3-1", "all"),
+        ],
+    );
+    let prefix = genmeta_xtask_release::publish::RemotePrefix::parse("ppa/genmeta")
+        .expect("prefix should parse");
+
+    let selected = genmeta_xtask_release::publish::publishable_deb_payloads_from_manifest_packages_and_remote_keys(
+        &manifest,
+        [
+            "Package: sample\nVersion: 1.2.3-1\nArchitecture: amd64\nFilename: pool/main/s/sample/sample_1.2.3-1_amd64.deb\n",
+        ],
+        &prefix,
+        [
+            "ppa/genmeta/pool/main/s/sample-common/sample-common_1.2.3-1_all.deb",
+        ],
+        compare_version_strings,
+    )
+    .expect("publishable deb payloads should resolve");
+
+    assert_eq!(selected, vec![linux_payload("sample", "1.2.4-1", "amd64")]);
+}
+
+#[test]
 fn retained_remote_linux_package_payloads_keep_all_remote_versions() {
     let manifest = linux_manifest(
         PackageSystem::Rpm,

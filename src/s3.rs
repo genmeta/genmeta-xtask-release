@@ -36,18 +36,20 @@ use crate::{
     package::{PackageId, ParsePackageIdError, ResolvePackageMetadataError, resolve_metadata},
     publish::{
         ImmutableCollisionError, LinuxPackagePayload, LinuxPayloadKeyError,
-        PublishableDebPayloadsFromManifestAndPackagesError,
+        PublishableDebPayloadsFromManifestPackagesAndRemoteKeysError,
         PublishableLinuxPayloadsFromManifestAndRemoteKeysError,
-        RemoteDebPackageEntriesFromPackagesError, RemoteDebPackageEntry, RemotePayloadState,
-        ResolveS3PublishTargetError, RetainedRemoteDebPackageEntriesError,
-        RetainedRemoteLinuxPackagePayloadsError, S3BrewPublishTarget, S3CommonPublishTarget,
-        S3DebPublishTarget, S3PublishTarget, S3RpmPublishTarget, S3ScoopPublishTarget,
-        UploadCondition, linux_payload_key, linux_repository_upload_order, mutable_entry_names,
-        plan_immutable_upload, plan_versioned_immutable_payload, publish_upload_order,
-        publishable_deb_payloads_from_manifest_and_packages,
+        RemoteDebPackageEntriesFromKeysError, RemoteDebPackageEntriesFromPackagesError,
+        RemoteDebPackageEntry, RemotePayloadState, ResolveS3PublishTargetError,
+        RetainedRemoteDebPackageEntriesError, RetainedRemoteLinuxPackagePayloadsError,
+        S3BrewPublishTarget, S3CommonPublishTarget, S3DebPublishTarget, S3PublishTarget,
+        S3RpmPublishTarget, S3ScoopPublishTarget, UploadCondition, linux_payload_key,
+        linux_repository_upload_order, mutable_entry_names, plan_immutable_upload,
+        plan_versioned_immutable_payload, publish_upload_order,
+        publishable_deb_payloads_from_manifest_packages_and_remote_keys,
         publishable_linux_payloads_from_manifest_and_remote_keys,
-        remote_deb_package_entries_from_packages, resolve_s3_publish_target,
-        retained_remote_deb_package_entries, retained_remote_linux_package_payloads,
+        remote_deb_package_entries_from_keys, remote_deb_package_entries_from_packages,
+        resolve_s3_publish_target, retained_remote_deb_package_entries,
+        retained_remote_linux_package_payloads,
     },
     scoop::RenderScoopJsonError,
     system::PackageSystem,
@@ -115,11 +117,16 @@ pub enum S3PublishError {
     RemotePackagesUtf8 { source: std::string::FromUtf8Error },
     #[snafu(display("failed to select publishable deb payloads"))]
     SelectPublishableDebPayloads {
-        source: PublishableDebPayloadsFromManifestAndPackagesError<CompareDebVersionError>,
+        source:
+            PublishableDebPayloadsFromManifestPackagesAndRemoteKeysError<CompareDebVersionError>,
     },
     #[snafu(display("failed to parse remote deb package entries"))]
     ParseRemoteDebEntries {
         source: RemoteDebPackageEntriesFromPackagesError,
+    },
+    #[snafu(display("failed to parse remote deb payload keys"))]
+    ParseRemoteDebKeys {
+        source: RemoteDebPackageEntriesFromKeysError,
     },
     #[snafu(display("failed to select retained remote deb packages"))]
     SelectRetainedDebEntries {
@@ -589,13 +596,25 @@ fn publish_deb(
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
     let remote_packages = remote_deb_packages(client, target.common.bucket.as_str(), &target)?;
-    let local_payloads = publishable_deb_payloads_from_manifest_and_packages(
+    let remote_keys = list_object_keys(
+        client,
+        target.common.bucket.as_str(),
+        target.prefix.as_str(),
+    )?;
+    let remote_deb_keys = remote_keys
+        .iter()
+        .filter(|key| key.ends_with(".deb"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let local_payloads = publishable_deb_payloads_from_manifest_packages_and_remote_keys(
         &manifest,
         remote_packages.iter().map(String::as_str),
+        &target.prefix,
+        remote_deb_keys.iter().copied(),
         compare_deb_versions,
     )
     .context(s3_publish_error::SelectPublishableDebPayloadsSnafu)?;
-    let remote_entries = remote_packages
+    let mut remote_entries = remote_packages
         .iter()
         .map(|content| remote_deb_package_entries_from_packages(content))
         .collect::<Result<Vec<_>, _>>()
@@ -603,6 +622,10 @@ fn publish_deb(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
+    remote_entries.extend(
+        remote_deb_package_entries_from_keys(&target.prefix, remote_deb_keys.iter().copied())
+            .context(s3_publish_error::ParseRemoteDebKeysSnafu)?,
+    );
     let retained = retained_remote_deb_package_entries(&manifest, remote_entries)
         .context(s3_publish_error::SelectRetainedDebEntriesSnafu)?;
     let conditions = remote_deb_entry_conditions(client, target.common.bucket.as_str(), &target)?;
