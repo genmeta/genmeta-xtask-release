@@ -1244,7 +1244,7 @@ fn classify_missing_object(code: Option<&str>, message: Option<&str>, status: Op
         Some("NoSuchKey") => true,
         Some("NotFound") => message
             .map(classify_not_found_message_as_object_missing)
-            .unwrap_or(false),
+            .unwrap_or(true),
         _ => false,
     }
 }
@@ -1345,4 +1345,33 @@ fn normalize_fingerprint(value: &str) -> String {
         .filter(|character| !character.is_whitespace())
         .flat_map(char::to_uppercase)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_missing_object;
+
+    #[test]
+    fn not_found_without_message_is_missing_object() {
+        assert!(classify_missing_object(Some("NotFound"), None, None));
+        assert!(classify_missing_object(Some("NotFound"), None, Some(404)));
+    }
+
+    #[test]
+    fn not_found_bucket_message_is_not_missing_object() {
+        assert!(!classify_missing_object(
+            Some("NotFound"),
+            Some("bucket does not exist"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn not_found_non_404_status_is_not_missing_object() {
+        assert!(!classify_missing_object(
+            Some("NotFound"),
+            Some("object not found"),
+            Some(403),
+        ));
+    }
 }
