@@ -749,7 +749,7 @@ fn deb_metadata_script(suite: &str, fingerprint: &str, has_passphrase: bool) -> 
     let architectures = APT_ARCHES.join(" ");
     let components = APT_COMPONENTS.join(" ");
     let mut script = String::from(
-        "set -euo pipefail\n\
+        "set -eu\n\
          export DEBIAN_FRONTEND=noninteractive\n\
          apt-get update -qq\n\
          apt-get install --assume-yes -qq dpkg-dev apt-utils gnupg gzip\n\
