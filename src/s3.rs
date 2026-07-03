@@ -3,15 +3,24 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     str::FromStr,
 };
 
+use aws_credential_types::Credentials;
+use aws_sdk_s3::{
+    Client,
+    config::{Region, RequestChecksumCalculation},
+    error::SdkError,
+    operation::{
+        get_object::GetObjectError, head_object::HeadObjectError,
+        list_objects_v2::ListObjectsV2Error, put_object::PutObjectError,
+    },
+    primitives::{ByteStream, ByteStreamError},
+};
 use sha2::Digest;
 use snafu::{OptionExt, ResultExt, Snafu, ensure};
 use tempfile::TempDir;
-use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
-use url::Url;
 use walkdir::WalkDir;
 
 use crate::{
@@ -47,12 +56,6 @@ use crate::{
 
 const APT_ARCHES: &[&str] = &["amd64", "arm64", "armhf", "i386"];
 const APT_COMPONENTS: &[&str] = &["main", "contrib", "non-free"];
-const AWS_REGION: &str = "auto";
-const AWS_SERVICE: &str = "s3";
-const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-const AMZ_DATE_FORMAT: &[FormatItem<'_>] =
-    format_description!("[year][month][day]T[hour][minute][second]Z");
-const DATE_SCOPE_FORMAT: &[FormatItem<'_>] = format_description!("[year][month][day]");
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -162,34 +165,35 @@ pub enum S3PublishError {
     ImmutableCollision { source: ImmutableCollisionError },
     #[snafu(display("metadata upload is missing remote baseline"))]
     MissingMetadataUploadBaseline,
-    #[snafu(display("failed to parse s3 endpoint url"))]
-    ParseEndpointUrl { source: url::ParseError },
-    #[snafu(display("s3 endpoint url is missing host"))]
-    MissingEndpointHost,
-    #[snafu(display("failed to format s3 signing timestamp"))]
-    FormatSigningTime { source: time::error::Format },
-    #[snafu(display("failed to run curl"))]
-    RunCurl { source: std::io::Error },
-    #[snafu(display("curl exited without http status"))]
-    MissingCurlStatus,
-    #[snafu(display("curl returned invalid http status"))]
-    InvalidCurlStatus { status: String },
-    #[snafu(display("failed to read curl response body"))]
-    ReadCurlResponseBody {
+    #[snafu(display("failed to create s3 runtime"))]
+    CreateS3Runtime { source: std::io::Error },
+    #[snafu(display("failed to read upload body"))]
+    ReadUploadBody {
         path: PathBuf,
-        source: std::io::Error,
+        source: ByteStreamError,
     },
-    #[snafu(display("failed to read curl response headers"))]
-    ReadCurlResponseHeaders {
-        path: PathBuf,
-        source: std::io::Error,
+    #[snafu(display("failed to read remote object body"))]
+    ReadRemoteObjectBody {
+        key: String,
+        source: ByteStreamError,
+    },
+    #[snafu(display("failed to read remote artifact body"))]
+    ReadRemoteArtifactBody {
+        key: String,
+        source: ByteStreamError,
     },
     #[snafu(display("remote object changed during conditional upload"))]
     ConditionalUploadChanged { key: String },
     #[snafu(display("failed to upload remote object"))]
-    UploadObject { key: String, status: u16 },
+    UploadObject {
+        key: String,
+        source: Box<SdkError<PutObjectError>>,
+    },
     #[snafu(display("failed to fetch remote object"))]
-    FetchObject { key: String, status: u16 },
+    FetchObject {
+        key: String,
+        source: Box<SdkError<GetObjectError>>,
+    },
     #[snafu(display("remote object is missing"))]
     MissingRemoteObject { key: String },
     #[snafu(display("failed to create download directory"))]
@@ -203,9 +207,15 @@ pub enum S3PublishError {
         source: std::io::Error,
     },
     #[snafu(display("failed to list s3 prefix"))]
-    ListObjects { prefix: String, status: u16 },
+    ListObjects {
+        prefix: String,
+        source: Box<SdkError<ListObjectsV2Error>>,
+    },
     #[snafu(display("failed to inspect remote object"))]
-    InspectObject { key: String, status: u16 },
+    InspectObject {
+        key: String,
+        source: Box<SdkError<HeadObjectError>>,
+    },
     #[snafu(display("remote object is missing ETag"))]
     MissingRemoteEtag { key: String },
     #[snafu(display("failed to read file for sha256"))]
@@ -242,11 +252,9 @@ struct PlannedUpload {
     condition: Option<UploadCondition>,
 }
 
-#[derive(Debug, Clone)]
 struct S3Client {
-    endpoint: Url,
-    access_key_id: String,
-    secret_access_key: String,
+    runtime: tokio::runtime::Runtime,
+    client: Client,
 }
 
 struct S3PublishContext<'a> {
@@ -255,23 +263,6 @@ struct S3PublishContext<'a> {
     contract: &'a ReleaseContract,
     options: &'a S3Options,
     client: &'a S3Client,
-}
-
-#[derive(Debug, Clone)]
-struct S3Response {
-    status: u16,
-    headers: BTreeMap<String, String>,
-    body: Vec<u8>,
-}
-
-struct S3Request<'a> {
-    method: &'a str,
-    bucket: &'a str,
-    key: &'a str,
-    query: &'a [(String, String)],
-    headers: BTreeMap<String, String>,
-    body_path: Option<&'a Path>,
-    payload_sha256: &'a str,
 }
 
 pub fn run(
@@ -345,12 +336,33 @@ fn manifest_package_metadata(
 }
 
 fn s3_client(common: &S3CommonPublishTarget) -> Result<S3Client, S3PublishError> {
+    let credentials = Credentials::new(
+        common.access_key_id.trim().to_string(),
+        common.secret_access_key.trim().to_string(),
+        None,
+        None,
+        "genmeta-xtask-release",
+    );
+    let config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
+        .region(Region::new("auto"))
+        .endpoint_url(common.endpoint_url.to_owned())
+        .credentials_provider(credentials)
+        .force_path_style(true)
+        // Cloudflare R2 rejects the aws-chunked PutObject requests generated by
+        // the SDK's default flexible checksum policy.
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .build();
     Ok(S3Client {
-        endpoint: Url::parse(&common.endpoint_url)
-            .context(s3_publish_error::ParseEndpointUrlSnafu)?,
-        access_key_id: common.access_key_id.trim().to_string(),
-        secret_access_key: common.secret_access_key.trim().to_string(),
+        runtime: tokio::runtime::Runtime::new().context(s3_publish_error::CreateS3RuntimeSnafu)?,
+        client: Client::from_conf(config),
     })
+}
+
+impl S3Client {
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.runtime.block_on(future)
+    }
 }
 
 fn target_summary(target: &S3PublishTarget) -> String {
@@ -1041,40 +1053,37 @@ fn upload_file(
     key: &str,
     condition: Option<UploadCondition>,
 ) -> Result<(), S3PublishError> {
-    let payload_sha256 = sha256_file(path)?;
-    let mut headers = BTreeMap::new();
+    let body = client.block_on(ByteStream::from_path(path)).context(
+        s3_publish_error::ReadUploadBodySnafu {
+            path: path.to_path_buf(),
+        },
+    )?;
+    let mut request = client
+        .client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(body);
     match condition {
         Some(UploadCondition::IfMissing) => {
-            headers.insert("if-none-match".to_string(), "*".to_string());
+            request = request.if_none_match("*");
         }
         Some(UploadCondition::IfMatch(etag)) => {
-            headers.insert("if-match".to_string(), etag);
+            request = request.if_match(etag);
         }
         None => {}
     }
-    let response = signed_s3_request(
-        client,
-        S3Request {
-            method: "PUT",
-            bucket,
-            key,
-            query: &[],
-            headers,
-            body_path: Some(path),
-            payload_sha256: &payload_sha256,
-        },
-    )?;
-    match response.status {
-        200..=299 => {}
-        409 | 412 => {
+    match client.block_on(request.send()) {
+        Ok(_) => {}
+        Err(error) if is_precondition_failed_error(&error) => {
             return Err(S3PublishError::ConditionalUploadChanged {
                 key: key.to_string(),
             });
         }
-        status => {
+        Err(source) => {
             return Err(S3PublishError::UploadObject {
                 key: key.to_string(),
-                status,
+                source: Box::new(source),
             });
         }
     }
@@ -1087,26 +1096,23 @@ fn get_object_bytes(
     bucket: &str,
     key: &str,
 ) -> Result<Option<Vec<u8>>, S3PublishError> {
-    let response = signed_s3_request(
-        client,
-        S3Request {
-            method: "GET",
-            bucket,
-            key,
-            query: &[],
-            headers: BTreeMap::new(),
-            body_path: None,
-            payload_sha256: EMPTY_SHA256,
-        },
-    )?;
-    match response.status {
-        200..=299 => Ok(Some(response.body)),
-        404 => Ok(None),
-        status => Err(S3PublishError::FetchObject {
+    let output = match client.block_on(client.client.get_object().bucket(bucket).key(key).send()) {
+        Ok(output) => output,
+        Err(error) if is_missing_object_error(&error) => return Ok(None),
+        Err(source) => {
+            return Err(S3PublishError::FetchObject {
+                key: key.to_string(),
+                source: Box::new(source),
+            });
+        }
+    };
+    let bytes = client
+        .block_on(output.body.collect())
+        .context(s3_publish_error::ReadRemoteObjectBodySnafu {
             key: key.to_string(),
-            status,
-        }),
-    }
+        })?
+        .to_vec();
+    Ok(Some(bytes))
 }
 
 fn download_object(
@@ -1135,45 +1141,28 @@ fn list_object_keys(
     bucket: &str,
     prefix: &str,
 ) -> Result<Vec<String>, S3PublishError> {
-    let mut keys = Vec::new();
-    let mut continuation = None::<String>;
-    loop {
-        let mut query = vec![("list-type".to_string(), "2".to_string())];
-        if !prefix.is_empty() {
-            query.push(("prefix".to_string(), prefix.to_string()));
-        }
-        if let Some(token) = &continuation {
-            query.push(("continuation-token".to_string(), token.clone()));
-        }
-        let response = signed_s3_request(
-            client,
-            S3Request {
-                method: "GET",
-                bucket,
-                key: "",
-                query: &query,
-                headers: BTreeMap::new(),
-                body_path: None,
-                payload_sha256: EMPTY_SHA256,
-            },
-        )?;
-        if !(200..=299).contains(&response.status) {
-            return Err(S3PublishError::ListObjects {
+    client.block_on(async {
+        let mut paginator = client
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
+        let mut keys = Vec::new();
+        while let Some(page) = paginator.next().await {
+            let page = page.map_err(|source| S3PublishError::ListObjects {
                 prefix: prefix.to_string(),
-                status: response.status,
-            });
+                source: Box::new(source),
+            })?;
+            for object in page.contents() {
+                if let Some(key) = object.key() {
+                    keys.push(key.to_string());
+                }
+            }
         }
-        let xml =
-            String::from_utf8(response.body).context(s3_publish_error::RemotePackagesUtf8Snafu)?;
-        keys.extend(xml_tag_values(&xml, "Key"));
-        continuation = xml_tag_values(&xml, "NextContinuationToken")
-            .into_iter()
-            .next();
-        if continuation.is_none() {
-            break;
-        }
-    }
-    Ok(keys)
+        Ok(keys)
+    })
 }
 
 fn remote_artifact_state(
@@ -1181,12 +1170,18 @@ fn remote_artifact_state(
     bucket: &str,
     key: &str,
 ) -> Result<RemotePayloadState, S3PublishError> {
-    let Some(bytes) = get_object_bytes(client, bucket, key)? else {
-        return Ok(RemotePayloadState::Missing);
+    let output = match client.block_on(client.client.get_object().bucket(bucket).key(key).send()) {
+        Ok(output) => output,
+        Err(error) if is_missing_object_error(&error) => return Ok(RemotePayloadState::Missing),
+        Err(source) => {
+            return Err(S3PublishError::FetchObject {
+                key: key.to_string(),
+                source: Box::new(source),
+            });
+        }
     };
-    Ok(RemotePayloadState::Present {
-        sha256: sha256_bytes(&bytes),
-    })
+    let sha256 = client.block_on(sha256_stream(output.body, key))?;
+    Ok(RemotePayloadState::Present { sha256 })
 }
 
 fn remote_upload_condition(
@@ -1194,274 +1189,87 @@ fn remote_upload_condition(
     bucket: &str,
     key: &str,
 ) -> Result<UploadCondition, S3PublishError> {
-    let response = signed_s3_request(
-        client,
-        S3Request {
-            method: "HEAD",
-            bucket,
-            key,
-            query: &[],
-            headers: BTreeMap::new(),
-            body_path: None,
-            payload_sha256: EMPTY_SHA256,
-        },
-    )?;
-    match response.status {
-        200..=299 => {
-            let etag =
-                response
-                    .headers
-                    .get("etag")
-                    .context(s3_publish_error::MissingRemoteEtagSnafu {
-                        key: key.to_string(),
-                    })?;
-            Ok(UploadCondition::IfMatch(etag.to_string()))
+    let output = match client.block_on(client.client.head_object().bucket(bucket).key(key).send()) {
+        Ok(output) => output,
+        Err(error) if is_missing_head_object_error(&error) => {
+            return Ok(UploadCondition::IfMissing);
         }
-        404 => Ok(UploadCondition::IfMissing),
-        status => Err(S3PublishError::InspectObject {
-            key: key.to_string(),
-            status,
-        }),
-    }
-}
-
-fn signed_s3_request(
-    client: &S3Client,
-    request: S3Request<'_>,
-) -> Result<S3Response, S3PublishError> {
-    let now = OffsetDateTime::now_utc();
-    let amz_date = now
-        .format(AMZ_DATE_FORMAT)
-        .context(s3_publish_error::FormatSigningTimeSnafu)?;
-    let date_scope = now
-        .format(DATE_SCOPE_FORMAT)
-        .context(s3_publish_error::FormatSigningTimeSnafu)?;
-    let host = client
-        .endpoint
-        .host_str()
-        .context(s3_publish_error::MissingEndpointHostSnafu)?;
-    let host = match client.endpoint.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
+        Err(source) => {
+            return Err(S3PublishError::InspectObject {
+                key: key.to_string(),
+                source: Box::new(source),
+            });
+        }
     };
-    let mut headers = request.headers;
-    headers.insert("host".to_string(), host);
-    headers.insert(
-        "x-amz-content-sha256".to_string(),
-        request.payload_sha256.to_string(),
-    );
-    headers.insert("x-amz-date".to_string(), amz_date.clone());
-
-    let canonical_uri = canonical_uri(request.bucket, request.key);
-    let canonical_query = canonical_query(request.query);
-    let canonical_headers = headers
-        .iter()
-        .map(|(name, value)| format!("{}:{}\n", name.to_ascii_lowercase(), value.trim()))
-        .collect::<String>();
-    let signed_headers = headers
-        .keys()
-        .map(|name| name.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join(";");
-    let canonical_request = format!(
-        "{}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{}",
-        request.method, request.payload_sha256
-    );
-    let scope = format!("{date_scope}/{AWS_REGION}/{AWS_SERVICE}/aws4_request");
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        sha256_hex(canonical_request.as_bytes())
-    );
-    let signature = aws_signature(&client.secret_access_key, &date_scope, &string_to_sign);
-    headers.insert(
-        "authorization".to_string(),
-        format!(
-            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-            client.access_key_id
-        ),
-    );
-
-    let url = request_url(&client.endpoint, &canonical_uri, &canonical_query);
-    run_curl(request.method, &url, &headers, request.body_path)
-}
-
-fn run_curl(
-    method: &str,
-    url: &str,
-    headers: &BTreeMap<String, String>,
-    body_path: Option<&Path>,
-) -> Result<S3Response, S3PublishError> {
-    let body = tempfile::NamedTempFile::new().context(s3_publish_error::CreateRepositorySnafu)?;
-    let header = tempfile::NamedTempFile::new().context(s3_publish_error::CreateRepositorySnafu)?;
-    let mut command = Command::new("curl");
-    command
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--location")
-        .arg("--request")
-        .arg(method)
-        .arg("--dump-header")
-        .arg(header.path())
-        .arg("--output")
-        .arg(body.path())
-        .arg("--write-out")
-        .arg("%{http_code}");
-    for (name, value) in headers {
-        command.arg("--header").arg(format!("{name}: {value}"));
-    }
-    if let Some(body_path) = body_path {
-        command.arg("--upload-file").arg(body_path);
-    }
-    command
-        .arg(url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let output = command.output().context(s3_publish_error::RunCurlSnafu)?;
-    let status_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if status_text.is_empty() {
-        return Err(S3PublishError::MissingCurlStatus);
-    }
-    let status = status_text
-        .parse::<u16>()
-        .map_err(|_| S3PublishError::InvalidCurlStatus {
-            status: status_text.clone(),
+    let etag = output
+        .e_tag()
+        .context(s3_publish_error::MissingRemoteEtagSnafu {
+            key: key.to_string(),
         })?;
-    let body_bytes =
-        fs::read(body.path()).context(s3_publish_error::ReadCurlResponseBodySnafu {
-            path: body.path().to_path_buf(),
-        })?;
-    let headers = response_headers(header.path())?;
-    Ok(S3Response {
-        status,
-        headers,
-        body: body_bytes,
-    })
+    Ok(UploadCondition::IfMatch(etag.to_string()))
 }
 
-fn response_headers(path: &Path) -> Result<BTreeMap<String, String>, S3PublishError> {
-    let text =
-        fs::read_to_string(path).context(s3_publish_error::ReadCurlResponseHeadersSnafu {
-            path: path.to_path_buf(),
-        })?;
-    let mut headers = BTreeMap::new();
-    for line in text.lines() {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+fn is_missing_object_error(error: &SdkError<GetObjectError, impl std::fmt::Debug>) -> bool {
+    if let Some(service) = error.as_service_error() {
+        let metadata = service.meta();
+        return classify_missing_object(metadata.code(), metadata.message(), None);
     }
-    Ok(headers)
+    false
 }
 
-fn request_url(endpoint: &Url, canonical_uri: &str, canonical_query: &str) -> String {
-    let mut url = endpoint.as_str().trim_end_matches('/').to_string();
-    url.push_str(canonical_uri);
-    if !canonical_query.is_empty() {
-        url.push('?');
-        url.push_str(canonical_query);
+fn is_missing_head_object_error(error: &SdkError<HeadObjectError, impl std::fmt::Debug>) -> bool {
+    if let Some(service) = error.as_service_error() {
+        let metadata = service.meta();
+        return classify_missing_object(metadata.code(), metadata.message(), None);
     }
-    url
+    false
 }
 
-fn canonical_uri(bucket: &str, key: &str) -> String {
-    let mut uri = String::from("/");
-    uri.push_str(&percent_encode_path_segment(bucket));
-    if !key.is_empty() {
-        uri.push('/');
-        uri.push_str(
-            &key.split('/')
-                .map(percent_encode_path_segment)
-                .collect::<Vec<_>>()
-                .join("/"),
+fn is_precondition_failed_error(error: &SdkError<PutObjectError, impl std::fmt::Debug>) -> bool {
+    if let Some(service) = error.as_service_error() {
+        let metadata = service.meta();
+        return matches!(
+            metadata.code(),
+            Some("PreconditionFailed") | Some("ConditionalRequestConflict")
         );
     }
-    uri
+    false
 }
 
-fn canonical_query(query: &[(String, String)]) -> String {
-    let mut encoded = query
-        .iter()
-        .map(|(name, value)| (percent_encode_query(name), percent_encode_query(value)))
-        .collect::<Vec<_>>();
-    encoded.sort();
-    encoded
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn percent_encode_path_segment(value: &str) -> String {
-    percent_encode(value, true)
-}
-
-fn percent_encode_query(value: &str) -> String {
-    percent_encode(value, false)
-}
-
-fn percent_encode(value: &str, keep_slash: bool) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        let keep = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-            || (keep_slash && byte == b'/');
-        if keep {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
+fn classify_missing_object(code: Option<&str>, message: Option<&str>, status: Option<u16>) -> bool {
+    if !matches!(status, None | Some(404)) {
+        return false;
     }
-    encoded
-}
-
-fn aws_signature(secret: &str, date_scope: &str, string_to_sign: &str) -> String {
-    let date_key = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_scope.as_bytes());
-    let region_key = hmac_sha256(&date_key, AWS_REGION.as_bytes());
-    let service_key = hmac_sha256(&region_key, AWS_SERVICE.as_bytes());
-    let signing_key = hmac_sha256(&service_key, b"aws4_request");
-    hex_lower(&hmac_sha256(&signing_key, string_to_sign.as_bytes()))
-}
-
-fn hmac_sha256(key: &[u8], value: &[u8]) -> Vec<u8> {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
-    ring::hmac::sign(&key, value).as_ref().to_vec()
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    sha256_hex(bytes)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex_lower(&sha2::Sha256::digest(bytes))
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn xml_tag_values(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let mut values = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        let value_start = start + open.len();
-        let Some(end) = rest[value_start..].find(&close) else {
-            break;
-        };
-        values.push(xml_unescape(&rest[value_start..value_start + end]));
-        rest = &rest[value_start + end + close.len()..];
+    match code {
+        Some("NoSuchKey") => true,
+        Some("NotFound") => message
+            .map(classify_not_found_message_as_object_missing)
+            .unwrap_or(false),
+        _ => false,
     }
-    values
 }
 
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+fn classify_not_found_message_as_object_missing(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if message.contains("bucket") {
+        return false;
+    }
+    message.contains("key") || message.contains("object") || message.contains("not found")
+}
+
+async fn sha256_stream(mut body: ByteStream, key: &str) -> Result<String, S3PublishError> {
+    let mut hasher = sha2::Sha256::new();
+    while let Some(bytes) =
+        body.next()
+            .await
+            .transpose()
+            .context(s3_publish_error::ReadRemoteArtifactBodySnafu {
+                key: key.to_string(),
+            })?
+    {
+        hasher.update(&bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn compare_deb_versions(left: &str, right: &str) -> Result<Ordering, CompareDebVersionError> {
