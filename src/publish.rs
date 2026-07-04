@@ -507,6 +507,55 @@ pub fn select_publishable_linux_payloads<E>(
     Ok(selected)
 }
 
+fn manifest_release_channel(
+    manifest: &PackageManifest,
+) -> Result<ReleaseChannel, ManifestReleaseChannelError> {
+    let version = Version::parse(&manifest.version).context(
+        manifest_release_channel_error::InvalidVersionSnafu {
+            version: manifest.version.clone(),
+        },
+    )?;
+    Ok(ReleaseChannel::from_version(&version))
+}
+
+fn linux_package_version_matches_channel(version: &str, channel: ReleaseChannel) -> bool {
+    let is_prerelease = version.contains('~');
+    match channel {
+        ReleaseChannel::Stable => !is_prerelease,
+        ReleaseChannel::Preview => is_prerelease,
+    }
+}
+
+fn filter_linux_payloads_for_channel(
+    payloads: Vec<LinuxPackagePayload>,
+    channel: ReleaseChannel,
+) -> Vec<LinuxPackagePayload> {
+    payloads
+        .into_iter()
+        .filter(|payload| linux_package_version_matches_channel(&payload.version, channel))
+        .collect()
+}
+
+fn filter_linux_versions_for_channel(
+    versions: Vec<LinuxPackageVersion>,
+    channel: ReleaseChannel,
+) -> Vec<LinuxPackageVersion> {
+    versions
+        .into_iter()
+        .filter(|version| linux_package_version_matches_channel(&version.version, channel))
+        .collect()
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ManifestReleaseChannelError {
+    #[snafu(display("manifest package version {version} is not a valid semver version"))]
+    InvalidVersion {
+        source: semver::Error,
+        version: String,
+    },
+}
+
 pub fn publishable_linux_payloads_from_manifest_and_remote_keys<'a, E>(
     manifest: &PackageManifest,
     prefix: &RemotePrefix,
@@ -516,6 +565,9 @@ pub fn publishable_linux_payloads_from_manifest_and_remote_keys<'a, E>(
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    let channel = manifest_release_channel(manifest).context(
+        publishable_linux_payloads_from_manifest_and_remote_keys_error::ManifestChannelSnafu,
+    )?;
     let local_payloads = linux_package_payloads_from_manifest(manifest).context(
         publishable_linux_payloads_from_manifest_and_remote_keys_error::LocalPayloadsSnafu,
     )?;
@@ -523,6 +575,8 @@ where
         remote_linux_payload_versions_from_keys(manifest.kind, prefix, remote_keys).context(
             publishable_linux_payloads_from_manifest_and_remote_keys_error::RemoteVersionsSnafu,
         )?;
+    let local_payloads = filter_linux_payloads_for_channel(local_payloads, channel);
+    let remote_versions = filter_linux_versions_for_channel(remote_versions, channel);
     select_publishable_linux_payloads(local_payloads, &remote_versions, compare_versions).context(
         publishable_linux_payloads_from_manifest_and_remote_keys_error::CompareVersionsSnafu,
     )
@@ -534,6 +588,8 @@ pub enum PublishableLinuxPayloadsFromManifestAndRemoteKeysError<E>
 where
     E: std::error::Error + Send + Sync + 'static,
 {
+    #[snafu(display("failed to resolve manifest release channel"))]
+    ManifestChannel { source: ManifestReleaseChannelError },
     #[snafu(display("failed to read linux package payloads from manifest"))]
     LocalPayloads {
         source: LinuxPackagePayloadsFromManifestError,
@@ -560,6 +616,8 @@ where
             system: manifest.kind
         }
     );
+    let channel = manifest_release_channel(manifest)
+        .context(publishable_deb_payloads_from_manifest_and_packages_error::ManifestChannelSnafu)?;
     let local_payloads = linux_package_payloads_from_manifest(manifest)
         .context(publishable_deb_payloads_from_manifest_and_packages_error::LocalPayloadsSnafu)?;
     let mut remote_versions = Vec::new();
@@ -569,6 +627,8 @@ where
         )?;
         remote_versions.extend(entries.into_iter().map(|entry| entry.version));
     }
+    let local_payloads = filter_linux_payloads_for_channel(local_payloads, channel);
+    let remote_versions = filter_linux_versions_for_channel(remote_versions, channel);
     select_publishable_linux_payloads(local_payloads, &remote_versions, compare_versions)
         .context(publishable_deb_payloads_from_manifest_and_packages_error::CompareVersionsSnafu)
 }
@@ -589,6 +649,9 @@ where
             system: manifest.kind
         }
     );
+    let channel = manifest_release_channel(manifest).context(
+        publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::ManifestChannelSnafu,
+    )?;
     let local_payloads = linux_package_payloads_from_manifest(manifest).context(
         publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::LocalPayloadsSnafu,
     )?;
@@ -603,6 +666,8 @@ where
         publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::RemoteKeysSnafu,
     )?;
     remote_versions.extend(entries.into_iter().map(|entry| entry.version));
+    let local_payloads = filter_linux_payloads_for_channel(local_payloads, channel);
+    let remote_versions = filter_linux_versions_for_channel(remote_versions, channel);
     select_publishable_linux_payloads(local_payloads, &remote_versions, compare_versions).context(
         publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::CompareVersionsSnafu,
     )
@@ -616,6 +681,8 @@ where
 {
     #[snafu(display("{system} package manifest is not a deb package manifest"))]
     WrongKind { system: PackageSystem },
+    #[snafu(display("failed to resolve manifest release channel"))]
+    ManifestChannel { source: ManifestReleaseChannelError },
     #[snafu(display("failed to read deb package payloads from manifest"))]
     LocalPayloads {
         source: LinuxPackagePayloadsFromManifestError,
@@ -636,6 +703,8 @@ where
 {
     #[snafu(display("{system} package manifest is not a deb package manifest"))]
     WrongKind { system: PackageSystem },
+    #[snafu(display("failed to resolve manifest release channel"))]
+    ManifestChannel { source: ManifestReleaseChannelError },
     #[snafu(display("failed to read deb package payloads from manifest"))]
     LocalPayloads {
         source: LinuxPackagePayloadsFromManifestError,
@@ -656,14 +725,18 @@ pub fn retained_remote_linux_package_payloads(
     manifest: &PackageManifest,
     remote_payloads: Vec<LinuxPackagePayload>,
 ) -> Result<Vec<LinuxPackagePayload>, RetainedRemoteLinuxPackagePayloadsError> {
+    let channel = manifest_release_channel(manifest)
+        .context(retained_remote_linux_package_payloads_error::ManifestChannelSnafu)?;
     linux_package_payloads_from_manifest(manifest)
         .context(retained_remote_linux_package_payloads_error::LocalPayloadsSnafu)?;
-    Ok(remote_payloads)
+    Ok(filter_linux_payloads_for_channel(remote_payloads, channel))
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum RetainedRemoteLinuxPackagePayloadsError {
+    #[snafu(display("failed to resolve manifest release channel"))]
+    ManifestChannel { source: ManifestReleaseChannelError },
     #[snafu(display("failed to read linux package payloads from manifest"))]
     LocalPayloads {
         source: LinuxPackagePayloadsFromManifestError,
@@ -680,9 +753,14 @@ pub fn retained_remote_deb_package_entries(
             system: manifest.kind
         }
     );
+    let channel = manifest_release_channel(manifest)
+        .context(retained_remote_deb_package_entries_error::ManifestChannelSnafu)?;
     linux_package_payloads_from_manifest(manifest)
         .context(retained_remote_deb_package_entries_error::LocalPayloadsSnafu)?;
-    Ok(remote_entries)
+    Ok(remote_entries
+        .into_iter()
+        .filter(|entry| linux_package_version_matches_channel(&entry.version.version, channel))
+        .collect())
 }
 
 #[derive(Debug, Snafu)]
@@ -690,6 +768,8 @@ pub fn retained_remote_deb_package_entries(
 pub enum RetainedRemoteDebPackageEntriesError {
     #[snafu(display("{system} package manifest is not a deb package manifest"))]
     WrongKind { system: PackageSystem },
+    #[snafu(display("failed to resolve manifest release channel"))]
+    ManifestChannel { source: ManifestReleaseChannelError },
     #[snafu(display("failed to read deb package payloads from manifest"))]
     LocalPayloads {
         source: LinuxPackagePayloadsFromManifestError,

@@ -2797,6 +2797,34 @@ fn publishable_linux_payloads_from_manifest_and_remote_keys_selects_candidates_o
 }
 
 #[test]
+fn publishable_linux_payloads_from_manifest_and_remote_keys_skip_channel_mismatched_payloads() {
+    let manifest = linux_manifest_with_version(
+        PackageSystem::Rpm,
+        "1.2.4-beta.1",
+        vec![
+            linux_artifact("sample", "1.2.4~beta.1-1", "x86_64"),
+            linux_artifact("sample-common", "1.2.3-1", "noarch"),
+        ],
+    );
+    let prefix = genmeta_xtask_release::publish::RemotePrefix::parse("rpm/sample")
+        .expect("prefix should parse");
+
+    let selected =
+        genmeta_xtask_release::publish::publishable_linux_payloads_from_manifest_and_remote_keys(
+            &manifest,
+            &prefix,
+            ["rpm/sample/sample/1.2.3-1/sample-1.2.3-1.x86_64.rpm"],
+            compare_version_strings,
+        )
+        .expect("publishable payloads should resolve");
+
+    assert_eq!(
+        selected,
+        vec![linux_payload("sample", "1.2.4~beta.1-1", "x86_64")]
+    );
+}
+
+#[test]
 fn publishable_linux_payloads_from_manifest_and_remote_keys_rejects_non_linux_manifest() {
     let manifest = PackageManifest {
         schema_version: 1,
@@ -2939,6 +2967,59 @@ fn publishable_deb_payloads_consider_remote_pool_payload_versions() {
 }
 
 #[test]
+fn publishable_deb_payloads_skip_channel_mismatched_payloads() {
+    let manifest = linux_manifest_with_version(
+        PackageSystem::Deb,
+        "1.2.4-beta.1",
+        vec![
+            linux_artifact("sample", "1.2.4~beta.1-1", "amd64"),
+            linux_artifact("sample-common", "1.2.3-1", "all"),
+        ],
+    );
+    let prefix = genmeta_xtask_release::publish::RemotePrefix::parse("ppa/genmeta")
+        .expect("prefix should parse");
+
+    let selected = genmeta_xtask_release::publish::publishable_deb_payloads_from_manifest_packages_and_remote_keys(
+        &manifest,
+        ["Package: sample\nVersion: 1.2.3-1\nArchitecture: amd64\nFilename: pool/main/s/sample/sample_1.2.3-1_amd64.deb\n"],
+        &prefix,
+        ["ppa/genmeta/pool/main/s/sample/sample_1.2.3-1_amd64.deb"],
+        compare_version_strings,
+    )
+    .expect("publishable deb payloads should resolve");
+
+    assert_eq!(
+        selected,
+        vec![linux_payload("sample", "1.2.4~beta.1-1", "amd64")]
+    );
+}
+
+#[test]
+fn retained_remote_linux_package_payloads_keep_only_manifest_channel_versions() {
+    let manifest = linux_manifest_with_version(
+        PackageSystem::Rpm,
+        "1.2.4-beta.1",
+        vec![linux_artifact("sample", "1.2.4~beta.1-1", "x86_64")],
+    );
+    let remote_payloads = vec![
+        linux_payload("sample", "1.2.3-1", "x86_64"),
+        linux_payload("sample", "1.2.4~beta.1-1", "x86_64"),
+        linux_payload("sample-common", "1.2.3-1", "noarch"),
+    ];
+
+    let retained = genmeta_xtask_release::publish::retained_remote_linux_package_payloads(
+        &manifest,
+        remote_payloads,
+    )
+    .expect("retained remote linux payloads should resolve");
+
+    assert_eq!(
+        retained,
+        vec![linux_payload("sample", "1.2.4~beta.1-1", "x86_64")]
+    );
+}
+
+#[test]
 fn retained_remote_linux_package_payloads_keep_all_remote_versions() {
     let manifest = linux_manifest(
         PackageSystem::Rpm,
@@ -2968,6 +3049,31 @@ fn retained_remote_linux_package_payloads_keep_all_remote_versions() {
             linux_payload("sample", "1.2.4-1", "aarch64"),
             linux_payload("sample-common", "1.2.4-1", "noarch"),
         ]
+    );
+}
+
+#[test]
+fn retained_remote_deb_package_entries_keep_only_manifest_channel_versions() {
+    let manifest = linux_manifest_with_version(
+        PackageSystem::Deb,
+        "1.2.4-beta.1",
+        vec![linux_artifact("sample", "1.2.4~beta.1-1", "amd64")],
+    );
+    let remote_entries = vec![
+        remote_deb_entry("sample", "1.2.3-1", "amd64"),
+        remote_deb_entry("sample", "1.2.4~beta.1-1", "amd64"),
+        remote_deb_entry("sample-common", "1.2.3-1", "all"),
+    ];
+
+    let retained = genmeta_xtask_release::publish::retained_remote_deb_package_entries(
+        &manifest,
+        remote_entries,
+    )
+    .expect("retained remote package entries should resolve");
+
+    assert_eq!(
+        retained,
+        vec![remote_deb_entry("sample", "1.2.4~beta.1-1", "amd64")]
     );
 }
 
@@ -3026,11 +3132,19 @@ fn publishable_deb_payloads_from_manifest_and_packages_rejects_rpm_manifest() {
 }
 
 fn linux_manifest(kind: PackageSystem, artifacts: Vec<PackageArtifact>) -> PackageManifest {
+    linux_manifest_with_version(kind, "1.2.3", artifacts)
+}
+
+fn linux_manifest_with_version(
+    kind: PackageSystem,
+    version: &str,
+    artifacts: Vec<PackageArtifact>,
+) -> PackageManifest {
     PackageManifest {
         schema_version: 1,
         kind,
         package: "sample".to_string(),
-        version: "1.2.3".to_string(),
+        version: version.to_string(),
         generated_at: "2026-06-29T00:00:00Z".to_string(),
         git_commit: None,
         git_dirty: false,
