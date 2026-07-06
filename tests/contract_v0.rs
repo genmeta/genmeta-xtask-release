@@ -2797,7 +2797,7 @@ fn publishable_linux_payloads_from_manifest_and_remote_keys_selects_candidates_o
 }
 
 #[test]
-fn publishable_linux_payloads_from_manifest_and_remote_keys_skip_channel_mismatched_payloads() {
+fn publishable_linux_payloads_from_manifest_and_remote_keys_include_preview_manifest_sidecars() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Rpm,
         "1.2.4-beta.1",
@@ -2820,7 +2820,10 @@ fn publishable_linux_payloads_from_manifest_and_remote_keys_skip_channel_mismatc
 
     assert_eq!(
         selected,
-        vec![linux_payload("sample", "1.2.4~beta.1-1", "x86_64")]
+        vec![
+            linux_payload("sample", "1.2.4~beta.1-1", "x86_64"),
+            linux_payload("sample-common", "1.2.3-1", "noarch"),
+        ]
     );
 }
 
@@ -2967,7 +2970,7 @@ fn publishable_deb_payloads_consider_remote_pool_payload_versions() {
 }
 
 #[test]
-fn publishable_deb_payloads_skip_channel_mismatched_payloads() {
+fn publishable_deb_payloads_include_preview_manifest_sidecars() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Deb,
         "1.2.4-beta.1",
@@ -2990,21 +2993,28 @@ fn publishable_deb_payloads_skip_channel_mismatched_payloads() {
 
     assert_eq!(
         selected,
-        vec![linux_payload("sample", "1.2.4~beta.1-1", "amd64")]
+        vec![
+            linux_payload("sample", "1.2.4~beta.1-1", "amd64"),
+            linux_payload("sample-common", "1.2.3-1", "all"),
+        ]
     );
 }
 
 #[test]
-fn retained_remote_linux_package_payloads_keep_only_manifest_channel_versions() {
+fn retained_remote_linux_package_payloads_keep_manifest_channel_and_preview_sidecar_versions() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Rpm,
         "1.2.4-beta.1",
-        vec![linux_artifact("sample", "1.2.4~beta.1-1", "x86_64")],
+        vec![
+            linux_artifact("sample", "1.2.4~beta.1-1", "x86_64"),
+            linux_artifact("sample-common", "1.2.3-1", "noarch"),
+        ],
     );
     let remote_payloads = vec![
         linux_payload("sample", "1.2.3-1", "x86_64"),
         linux_payload("sample", "1.2.4~beta.1-1", "x86_64"),
         linux_payload("sample-common", "1.2.3-1", "noarch"),
+        linux_payload("unrelated-common", "1.2.3-1", "noarch"),
     ];
 
     let retained = genmeta_xtask_release::publish::retained_remote_linux_package_payloads(
@@ -3015,7 +3025,10 @@ fn retained_remote_linux_package_payloads_keep_only_manifest_channel_versions() 
 
     assert_eq!(
         retained,
-        vec![linux_payload("sample", "1.2.4~beta.1-1", "x86_64")]
+        vec![
+            linux_payload("sample", "1.2.4~beta.1-1", "x86_64"),
+            linux_payload("sample-common", "1.2.3-1", "noarch"),
+        ]
     );
 }
 
@@ -3053,16 +3066,20 @@ fn retained_remote_linux_package_payloads_keep_all_remote_versions() {
 }
 
 #[test]
-fn retained_remote_deb_package_entries_keep_only_manifest_channel_versions() {
+fn retained_remote_deb_package_entries_keep_manifest_channel_and_preview_sidecar_versions() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Deb,
         "1.2.4-beta.1",
-        vec![linux_artifact("sample", "1.2.4~beta.1-1", "amd64")],
+        vec![
+            linux_artifact("sample", "1.2.4~beta.1-1", "amd64"),
+            linux_artifact("sample-common", "1.2.3-1", "all"),
+        ],
     );
     let remote_entries = vec![
         remote_deb_entry("sample", "1.2.3-1", "amd64"),
         remote_deb_entry("sample", "1.2.4~beta.1-1", "amd64"),
         remote_deb_entry("sample-common", "1.2.3-1", "all"),
+        remote_deb_entry("unrelated-common", "1.2.3-1", "all"),
     ];
 
     let retained = genmeta_xtask_release::publish::retained_remote_deb_package_entries(
@@ -3073,7 +3090,10 @@ fn retained_remote_deb_package_entries_keep_only_manifest_channel_versions() {
 
     assert_eq!(
         retained,
-        vec![remote_deb_entry("sample", "1.2.4~beta.1-1", "amd64")]
+        vec![
+            remote_deb_entry("sample", "1.2.4~beta.1-1", "amd64"),
+            remote_deb_entry("sample-common", "1.2.3-1", "all"),
+        ]
     );
 }
 
