@@ -526,58 +526,23 @@ fn linux_package_version_matches_channel(version: &str, channel: ReleaseChannel)
     }
 }
 
-fn preview_sidecar_keys(
-    local_payloads: &[LinuxPackagePayload],
-    channel: ReleaseChannel,
-) -> BTreeSet<(String, String)> {
-    if channel != ReleaseChannel::Preview {
-        return BTreeSet::new();
-    }
-    local_payloads
-        .iter()
-        .filter(|payload| !linux_package_version_matches_channel(&payload.version, channel))
-        .map(|payload| (payload.package.clone(), payload.architecture.clone()))
-        .collect()
-}
-
-fn linux_package_version_matches_channel_or_preview_sidecar(
-    version: &LinuxPackageVersion,
-    channel: ReleaseChannel,
-    preview_sidecar_keys: &BTreeSet<(String, String)>,
-) -> bool {
-    linux_package_version_matches_channel(&version.version, channel)
-        || preview_sidecar_keys.contains(&(version.package.clone(), version.architecture.clone()))
-}
-
-fn filter_linux_payloads_for_channel_and_preview_sidecars(
+fn filter_linux_payloads_for_channel(
     payloads: Vec<LinuxPackagePayload>,
     channel: ReleaseChannel,
-    preview_sidecar_keys: &BTreeSet<(String, String)>,
 ) -> Vec<LinuxPackagePayload> {
     payloads
         .into_iter()
-        .filter(|payload| {
-            linux_package_version_matches_channel(&payload.version, channel)
-                || preview_sidecar_keys
-                    .contains(&(payload.package.clone(), payload.architecture.clone()))
-        })
+        .filter(|payload| linux_package_version_matches_channel(&payload.version, channel))
         .collect()
 }
 
-fn filter_linux_versions_for_channel_and_preview_sidecars(
+fn filter_linux_versions_for_channel(
     versions: Vec<LinuxPackageVersion>,
     channel: ReleaseChannel,
-    preview_sidecar_keys: &BTreeSet<(String, String)>,
 ) -> Vec<LinuxPackageVersion> {
     versions
         .into_iter()
-        .filter(|version| {
-            linux_package_version_matches_channel_or_preview_sidecar(
-                version,
-                channel,
-                preview_sidecar_keys,
-            )
-        })
+        .filter(|version| linux_package_version_matches_channel(&version.version, channel))
         .collect()
 }
 
@@ -610,17 +575,8 @@ where
         remote_linux_payload_versions_from_keys(manifest.kind, prefix, remote_keys).context(
             publishable_linux_payloads_from_manifest_and_remote_keys_error::RemoteVersionsSnafu,
         )?;
-    let preview_sidecar_keys = preview_sidecar_keys(&local_payloads, channel);
-    let local_payloads = filter_linux_payloads_for_channel_and_preview_sidecars(
-        local_payloads,
-        channel,
-        &preview_sidecar_keys,
-    );
-    let remote_versions = filter_linux_versions_for_channel_and_preview_sidecars(
-        remote_versions,
-        channel,
-        &preview_sidecar_keys,
-    );
+    let local_payloads = filter_linux_payloads_for_channel(local_payloads, channel);
+    let remote_versions = filter_linux_versions_for_channel(remote_versions, channel);
     select_publishable_linux_payloads(local_payloads, &remote_versions, compare_versions).context(
         publishable_linux_payloads_from_manifest_and_remote_keys_error::CompareVersionsSnafu,
     )
@@ -671,17 +627,8 @@ where
         )?;
         remote_versions.extend(entries.into_iter().map(|entry| entry.version));
     }
-    let preview_sidecar_keys = preview_sidecar_keys(&local_payloads, channel);
-    let local_payloads = filter_linux_payloads_for_channel_and_preview_sidecars(
-        local_payloads,
-        channel,
-        &preview_sidecar_keys,
-    );
-    let remote_versions = filter_linux_versions_for_channel_and_preview_sidecars(
-        remote_versions,
-        channel,
-        &preview_sidecar_keys,
-    );
+    let local_payloads = filter_linux_payloads_for_channel(local_payloads, channel);
+    let remote_versions = filter_linux_versions_for_channel(remote_versions, channel);
     select_publishable_linux_payloads(local_payloads, &remote_versions, compare_versions)
         .context(publishable_deb_payloads_from_manifest_and_packages_error::CompareVersionsSnafu)
 }
@@ -719,17 +666,8 @@ where
         publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::RemoteKeysSnafu,
     )?;
     remote_versions.extend(entries.into_iter().map(|entry| entry.version));
-    let preview_sidecar_keys = preview_sidecar_keys(&local_payloads, channel);
-    let local_payloads = filter_linux_payloads_for_channel_and_preview_sidecars(
-        local_payloads,
-        channel,
-        &preview_sidecar_keys,
-    );
-    let remote_versions = filter_linux_versions_for_channel_and_preview_sidecars(
-        remote_versions,
-        channel,
-        &preview_sidecar_keys,
-    );
+    let local_payloads = filter_linux_payloads_for_channel(local_payloads, channel);
+    let remote_versions = filter_linux_versions_for_channel(remote_versions, channel);
     select_publishable_linux_payloads(local_payloads, &remote_versions, compare_versions).context(
         publishable_deb_payloads_from_manifest_packages_and_remote_keys_error::CompareVersionsSnafu,
     )
@@ -789,14 +727,9 @@ pub fn retained_remote_linux_package_payloads(
 ) -> Result<Vec<LinuxPackagePayload>, RetainedRemoteLinuxPackagePayloadsError> {
     let channel = manifest_release_channel(manifest)
         .context(retained_remote_linux_package_payloads_error::ManifestChannelSnafu)?;
-    let local_payloads = linux_package_payloads_from_manifest(manifest)
+    let _local_payloads = linux_package_payloads_from_manifest(manifest)
         .context(retained_remote_linux_package_payloads_error::LocalPayloadsSnafu)?;
-    let preview_sidecar_keys = preview_sidecar_keys(&local_payloads, channel);
-    Ok(filter_linux_payloads_for_channel_and_preview_sidecars(
-        remote_payloads,
-        channel,
-        &preview_sidecar_keys,
-    ))
+    Ok(filter_linux_payloads_for_channel(remote_payloads, channel))
 }
 
 #[derive(Debug, Snafu)]
@@ -822,18 +755,11 @@ pub fn retained_remote_deb_package_entries(
     );
     let channel = manifest_release_channel(manifest)
         .context(retained_remote_deb_package_entries_error::ManifestChannelSnafu)?;
-    let local_payloads = linux_package_payloads_from_manifest(manifest)
+    let _local_payloads = linux_package_payloads_from_manifest(manifest)
         .context(retained_remote_deb_package_entries_error::LocalPayloadsSnafu)?;
-    let preview_sidecar_keys = preview_sidecar_keys(&local_payloads, channel);
     Ok(remote_entries
         .into_iter()
-        .filter(|entry| {
-            linux_package_version_matches_channel_or_preview_sidecar(
-                &entry.version,
-                channel,
-                &preview_sidecar_keys,
-            )
-        })
+        .filter(|entry| linux_package_version_matches_channel(&entry.version.version, channel))
         .collect())
 }
 

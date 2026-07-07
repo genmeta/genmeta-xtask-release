@@ -86,6 +86,9 @@ struct S3PublishCommandCli {
     /// Show upload actions without mutating remote storage
     #[arg(long)]
     dry_run: bool,
+    /// Write a TOML report listing release assets selected by publish planning
+    #[arg(long)]
+    publish_report: Option<PathBuf>,
     /// Package systems to publish
     #[arg(required = true, value_parser = parse_package_system)]
     systems: Vec<PackageSystem>,
@@ -614,6 +617,7 @@ pub fn parse_s3_publish_requests(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3PublishCommandRequest {
     pub dry_run: bool,
+    pub publish_report: Option<PathBuf>,
     pub systems: Vec<PackageSystem>,
 }
 
@@ -636,6 +640,7 @@ fn s3_publish_command_request(
         .context(parse_s3_publish_command_request_error::PublishRequestsSnafu)?;
     Ok(S3PublishCommandRequest {
         dry_run: command.dry_run,
+        publish_report: command.publish_report,
         systems: command.systems,
     })
 }
@@ -851,7 +856,23 @@ mod tests {
                 .expect("s3 publish command should parse");
 
         assert!(command.dry_run);
+        assert_eq!(command.publish_report, None);
         assert_eq!(command.systems.len(), 2);
+    }
+
+    #[test]
+    fn s3_publish_command_accepts_toml_publish_report_path() {
+        let command = parse_s3_publish_command_request(
+            &contract(),
+            &os_args(&["--publish-report", "target/publish-reports/deb.toml", "deb"]),
+        )
+        .expect("s3 publish command should parse a TOML publish report path");
+
+        assert_eq!(
+            command.publish_report,
+            Some(std::path::PathBuf::from("target/publish-reports/deb.toml"))
+        );
+        assert_eq!(command.systems, [crate::system::PackageSystem::Deb]);
     }
 
     #[test]

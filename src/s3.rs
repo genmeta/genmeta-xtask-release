@@ -51,6 +51,7 @@ use crate::{
         resolve_s3_publish_target, retained_remote_deb_package_entries,
         retained_remote_linux_package_payloads,
     },
+    report::{S3PublishReport, S3PublishReportArtifact, S3PublishReportManifest},
     scoop::RenderScoopJsonError,
     system::PackageSystem,
     template::{RenderTemplateError, render_template},
@@ -89,6 +90,23 @@ pub enum S3PublishError {
     },
     #[snafu(display("failed to write publish metadata"))]
     WritePublishMetadata {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("failed to read publish report artifact metadata"))]
+    PublishReportArtifactMetadata {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("failed to serialize publish report"))]
+    SerializePublishReport { source: toml::ser::Error },
+    #[snafu(display("failed to create publish report directory"))]
+    CreatePublishReportDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("failed to write publish report"))]
+    WritePublishReport {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -158,6 +176,16 @@ pub enum S3PublishError {
     },
     #[snafu(display("failed to resolve remote rpm payload key"))]
     ResolveRpmPayloadKey { source: LinuxPayloadKeyError },
+    #[snafu(display("failed to resolve linux payload key"))]
+    ResolveLinuxPayloadKey { source: LinuxPayloadKeyError },
+    #[snafu(display(
+        "selected linux payload {package} {version} for {architecture} is missing from package manifest"
+    ))]
+    MissingLinuxReportArtifact {
+        package: String,
+        version: String,
+        architecture: String,
+    },
     #[snafu(display("failed to run rpm metadata container"))]
     RunRpmMetadataContainer { source: std::io::Error },
     #[snafu(display("rpm metadata container failed"))]
@@ -293,6 +321,7 @@ fn run_inner(
     let options = S3Options {
         dry_run: command.dry_run,
     };
+    let mut report = S3PublishReport::new(command.dry_run);
     for manifest in manifests {
         let (package_id, metadata) = manifest_package_metadata(root, contract, &manifest)?;
         let channel = ReleaseChannel::from_version(&metadata.source_version);
@@ -314,19 +343,54 @@ fn run_inner(
         };
         match target {
             S3PublishTarget::Brew(target) => {
-                publish_brew(&publish_context, target, package_id, metadata, manifest)?;
+                publish_brew(
+                    &publish_context,
+                    &mut report,
+                    target,
+                    package_id,
+                    metadata,
+                    manifest,
+                )?;
             }
             S3PublishTarget::Scoop(target) => {
-                publish_scoop(&publish_context, target, package_id, metadata, manifest)?;
+                publish_scoop(
+                    &publish_context,
+                    &mut report,
+                    target,
+                    package_id,
+                    metadata,
+                    manifest,
+                )?;
             }
             S3PublishTarget::Deb(target) => {
-                publish_deb(target_dir, &options, &client, target, manifest)?;
+                publish_deb(target_dir, &options, &client, &mut report, target, manifest)?;
             }
             S3PublishTarget::Rpm(target) => {
-                publish_rpm(target_dir, &options, &client, target, manifest)?;
+                publish_rpm(target_dir, &options, &client, &mut report, target, manifest)?;
             }
         }
     }
+    if let Some(path) = &command.publish_report {
+        write_publish_report(path, &report)?;
+    }
+    Ok(())
+}
+
+fn write_publish_report(path: &Path, report: &S3PublishReport) -> Result<(), S3PublishError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).context(s3_publish_error::CreatePublishReportDirSnafu {
+            path: parent.to_path_buf(),
+        })?;
+    }
+    let content = report
+        .to_toml_string()
+        .context(s3_publish_error::SerializePublishReportSnafu)?;
+    fs::write(path, content).context(s3_publish_error::WritePublishReportSnafu {
+        path: path.to_path_buf(),
+    })?;
     Ok(())
 }
 
@@ -395,18 +459,22 @@ fn target_summary(target: &S3PublishTarget) -> String {
 
 fn publish_brew(
     context: &S3PublishContext<'_>,
+    report: &mut S3PublishReport,
     target: S3BrewPublishTarget,
     package_id: PackageId,
     metadata: crate::package::ResolvedPackageMetadata,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
-    let (mut uploads, manifest) = plan_versioned_archive_uploads(
+    let archive_plan = plan_versioned_archive_uploads(
         context.target_dir,
         context.client,
         target.common.bucket.as_str(),
         &target.prefix,
         manifest,
     )?;
+    let mut uploads = archive_plan.uploads;
+    let manifest = archive_plan.manifest;
+    let mut report_artifacts = archive_plan.report_artifacts;
     let template = manifest_template(
         context.root,
         context.contract,
@@ -432,6 +500,20 @@ fn publish_brew(
     fs::write(&versioned, formula).context(s3_publish_error::WritePublishMetadataSnafu {
         path: versioned.clone(),
     })?;
+    report_artifacts.push(report_artifact_from_generated_file(
+        context.target_dir,
+        &versioned,
+        target.prefix.join(&names.versioned),
+    )?);
+    report.add_manifest(S3PublishReportManifest {
+        kind: PackageSystem::Brew,
+        package: package_id.as_str().to_string(),
+        version: metadata.source_version.to_string(),
+        generated_at: manifest.generated_at.clone(),
+        git_commit: manifest.git_commit.clone(),
+        git_dirty: manifest.git_dirty,
+        artifacts: report_artifacts,
+    });
     uploads.push(PlannedUpload {
         path: latest,
         key: target.prefix.join(&names.latest),
@@ -454,18 +536,22 @@ fn publish_brew(
 
 fn publish_scoop(
     context: &S3PublishContext<'_>,
+    report: &mut S3PublishReport,
     target: S3ScoopPublishTarget,
     package_id: PackageId,
     metadata: crate::package::ResolvedPackageMetadata,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
-    let (mut uploads, manifest) = plan_versioned_archive_uploads(
+    let archive_plan = plan_versioned_archive_uploads(
         context.target_dir,
         context.client,
         target.common.bucket.as_str(),
         &target.prefix,
         manifest,
     )?;
+    let mut uploads = archive_plan.uploads;
+    let manifest = archive_plan.manifest;
+    let mut report_artifacts = archive_plan.report_artifacts;
     let template = manifest_template(
         context.root,
         context.contract,
@@ -496,6 +582,20 @@ fn publish_scoop(
     fs::write(&versioned, json).context(s3_publish_error::WritePublishMetadataSnafu {
         path: versioned.clone(),
     })?;
+    report_artifacts.push(report_artifact_from_generated_file(
+        context.target_dir,
+        &versioned,
+        target.prefix.join(&names.versioned),
+    )?);
+    report.add_manifest(S3PublishReportManifest {
+        kind: PackageSystem::Scoop,
+        package: package_id.as_str().to_string(),
+        version: metadata.source_version.to_string(),
+        generated_at: manifest.generated_at.clone(),
+        git_commit: manifest.git_commit.clone(),
+        git_dirty: manifest.git_dirty,
+        artifacts: report_artifacts,
+    });
     uploads.push(PlannedUpload {
         path: latest,
         key: target.prefix.join(&names.latest),
@@ -516,14 +616,21 @@ fn publish_scoop(
     )
 }
 
+struct VersionedArchiveUploadPlan {
+    uploads: Vec<PlannedUpload>,
+    manifest: PackageManifest,
+    report_artifacts: Vec<S3PublishReportArtifact>,
+}
+
 fn plan_versioned_archive_uploads(
     target_dir: &Path,
     client: &S3Client,
     bucket: &str,
     prefix: &crate::publish::RemotePrefix,
     mut manifest: PackageManifest,
-) -> Result<(Vec<PlannedUpload>, PackageManifest), S3PublishError> {
+) -> Result<VersionedArchiveUploadPlan, S3PublishError> {
     let mut uploads = Vec::new();
+    let mut report_artifacts = Vec::new();
     for artifact in &mut manifest.artifacts {
         let archive_name = artifact
             .archive_name
@@ -540,11 +647,13 @@ fn plan_versioned_archive_uploads(
         let key = prefix.join(&archive_name);
         let remote = remote_artifact_state(client, bucket, &key)?;
         let plan = plan_versioned_immutable_payload(&key, &actual_sha256, remote);
+        let report_local_artifact =
+            plan.upload_condition().is_some() || plan.remote_sha256_matches_local();
         artifact.sha256 = plan.metadata_sha256().to_string();
         if let Some(condition) = plan.upload_condition() {
             uploads.push(PlannedUpload {
                 path,
-                key,
+                key: key.clone(),
                 entry: false,
                 condition: Some(condition),
             });
@@ -555,8 +664,17 @@ fn plan_versioned_archive_uploads(
                 "remote immutable package artifact already exists with different sha256; reusing remote payload for metadata: {key}"
             );
         }
+        if report_local_artifact {
+            report_artifacts.push(report_artifact_from_manifest_artifact(
+                target_dir, artifact, key,
+            ));
+        }
     }
-    Ok((uploads, manifest))
+    Ok(VersionedArchiveUploadPlan {
+        uploads,
+        manifest,
+        report_artifacts,
+    })
 }
 
 fn manifest_template(
@@ -592,6 +710,7 @@ fn publish_deb(
     target_dir: &Path,
     options: &S3Options,
     client: &S3Client,
+    report: &mut S3PublishReport,
     target: S3DebPublishTarget,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
@@ -614,6 +733,12 @@ fn publish_deb(
         compare_deb_versions,
     )
     .context(s3_publish_error::SelectPublishableDebPayloadsSnafu)?;
+    report.add_manifest(linux_report_manifest(
+        target_dir,
+        &manifest,
+        &target.prefix,
+        &local_payloads,
+    )?);
     let mut remote_entries = remote_packages
         .iter()
         .map(|content| remote_deb_package_entries_from_packages(content))
@@ -842,6 +967,7 @@ fn publish_rpm(
     target_dir: &Path,
     options: &S3Options,
     client: &S3Client,
+    report: &mut S3PublishReport,
     target: S3RpmPublishTarget,
     manifest: PackageManifest,
 ) -> Result<(), S3PublishError> {
@@ -862,6 +988,12 @@ fn publish_rpm(
         compare_rpm_versions,
     )
     .context(s3_publish_error::SelectPublishableRpmPayloadsSnafu)?;
+    report.add_manifest(linux_report_manifest(
+        target_dir,
+        &manifest,
+        &target.prefix,
+        &local_payloads,
+    )?);
     let mut retained_remote_payloads = Vec::new();
     for key in remote_rpm_keys {
         retained_remote_payloads.push(remote_rpm_payload_to_linux_payload(&target.prefix, key)?);
@@ -887,6 +1019,97 @@ fn publish_rpm(
             .then_with(|| left.key.cmp(&right.key))
     });
     publish_uploads(options, client, target.common.bucket.as_str(), uploads)
+}
+
+fn report_artifact_from_manifest_artifact(
+    target_dir: &Path,
+    artifact: &PackageArtifact,
+    key: String,
+) -> S3PublishReportArtifact {
+    S3PublishReportArtifact {
+        target: artifact.target.clone(),
+        path: path_to_slash(Path::new(&artifact.path)),
+        local_path: path_to_slash(&artifact_path(target_dir, artifact)),
+        sha256: artifact.sha256.clone(),
+        size: artifact.size,
+        package_name: artifact.package_name.clone(),
+        package_version: artifact.package_version.clone(),
+        architecture: artifact.architecture.clone(),
+        archive_name: artifact.archive_name.clone(),
+        key,
+    }
+}
+
+fn report_artifact_from_generated_file(
+    target_dir: &Path,
+    path: &Path,
+    key: String,
+) -> Result<S3PublishReportArtifact, S3PublishError> {
+    let metadata =
+        fs::metadata(path).context(s3_publish_error::PublishReportArtifactMetadataSnafu {
+            path: path.to_path_buf(),
+        })?;
+    let relative = path
+        .strip_prefix(target_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    Ok(S3PublishReportArtifact {
+        target: "common".to_string(),
+        path: path_to_slash(Path::new(&relative)),
+        local_path: path_to_slash(path),
+        sha256: sha256_file(path)?,
+        size: metadata.len(),
+        package_name: None,
+        package_version: None,
+        architecture: None,
+        archive_name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned),
+        key,
+    })
+}
+
+fn linux_report_manifest(
+    target_dir: &Path,
+    manifest: &PackageManifest,
+    prefix: &crate::publish::RemotePrefix,
+    payloads: &[LinuxPackagePayload],
+) -> Result<S3PublishReportManifest, S3PublishError> {
+    let artifacts = payloads
+        .iter()
+        .map(|payload| {
+            let artifact = manifest
+                .artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.package_name.as_deref() == Some(payload.package.as_str())
+                        && artifact.package_version.as_deref() == Some(payload.version.as_str())
+                        && artifact.architecture.as_deref() == Some(payload.architecture.as_str())
+                        && artifact.path == payload.path
+                })
+                .ok_or_else(|| S3PublishError::MissingLinuxReportArtifact {
+                    package: payload.package.clone(),
+                    version: payload.version.clone(),
+                    architecture: payload.architecture.clone(),
+                })?;
+            let key = linux_payload_key(prefix, manifest.kind, payload)
+                .context(s3_publish_error::ResolveLinuxPayloadKeySnafu)?;
+            Ok(report_artifact_from_manifest_artifact(
+                target_dir, artifact, key,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(S3PublishReportManifest {
+        kind: manifest.kind,
+        package: manifest.package.clone(),
+        version: manifest.version.clone(),
+        generated_at: manifest.generated_at.clone(),
+        git_commit: manifest.git_commit.clone(),
+        git_dirty: manifest.git_dirty,
+        artifacts,
+    })
 }
 
 fn remote_rpm_payload_to_linux_payload(

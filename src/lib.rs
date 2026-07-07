@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod package;
 pub mod plan;
 pub mod publish;
+pub mod report;
 pub mod requires;
 pub mod runner;
 pub mod s3;

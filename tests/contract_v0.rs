@@ -2797,7 +2797,7 @@ fn publishable_linux_payloads_from_manifest_and_remote_keys_selects_candidates_o
 }
 
 #[test]
-fn publishable_linux_payloads_from_manifest_and_remote_keys_include_preview_manifest_sidecars() {
+fn publishable_linux_payloads_from_manifest_and_keys_exclude_stable_preview_sidecars() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Rpm,
         "1.2.4-beta.1",
@@ -2820,10 +2820,7 @@ fn publishable_linux_payloads_from_manifest_and_remote_keys_include_preview_mani
 
     assert_eq!(
         selected,
-        vec![
-            linux_payload("sample", "1.2.4~beta.1-1", "x86_64"),
-            linux_payload("sample-common", "1.2.3-1", "noarch"),
-        ]
+        vec![linux_payload("sample", "1.2.4~beta.1-1", "x86_64")]
     );
 }
 
@@ -2970,7 +2967,7 @@ fn publishable_deb_payloads_consider_remote_pool_payload_versions() {
 }
 
 #[test]
-fn publishable_deb_payloads_include_preview_manifest_sidecars() {
+fn publishable_deb_payloads_exclude_stable_payloads_from_preview_manifest() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Deb,
         "1.2.4-beta.1",
@@ -2993,15 +2990,12 @@ fn publishable_deb_payloads_include_preview_manifest_sidecars() {
 
     assert_eq!(
         selected,
-        vec![
-            linux_payload("sample", "1.2.4~beta.1-1", "amd64"),
-            linux_payload("sample-common", "1.2.3-1", "all"),
-        ]
+        vec![linux_payload("sample", "1.2.4~beta.1-1", "amd64")]
     );
 }
 
 #[test]
-fn retained_remote_linux_package_payloads_keep_manifest_channel_and_preview_sidecar_versions() {
+fn retained_remote_linux_package_payloads_keep_preview_versions_only_for_preview_metadata() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Rpm,
         "1.2.4-beta.1",
@@ -3025,10 +3019,7 @@ fn retained_remote_linux_package_payloads_keep_manifest_channel_and_preview_side
 
     assert_eq!(
         retained,
-        vec![
-            linux_payload("sample", "1.2.4~beta.1-1", "x86_64"),
-            linux_payload("sample-common", "1.2.3-1", "noarch"),
-        ]
+        vec![linux_payload("sample", "1.2.4~beta.1-1", "x86_64")]
     );
 }
 
@@ -3066,7 +3057,7 @@ fn retained_remote_linux_package_payloads_keep_all_remote_versions() {
 }
 
 #[test]
-fn retained_remote_deb_package_entries_keep_manifest_channel_and_preview_sidecar_versions() {
+fn retained_remote_deb_package_entries_keep_preview_versions_only_for_preview_metadata() {
     let manifest = linux_manifest_with_version(
         PackageSystem::Deb,
         "1.2.4-beta.1",
@@ -3090,10 +3081,7 @@ fn retained_remote_deb_package_entries_keep_manifest_channel_and_preview_sidecar
 
     assert_eq!(
         retained,
-        vec![
-            remote_deb_entry("sample", "1.2.4~beta.1-1", "amd64"),
-            remote_deb_entry("sample-common", "1.2.3-1", "all"),
-        ]
+        vec![remote_deb_entry("sample", "1.2.4~beta.1-1", "amd64")]
     );
 }
 
@@ -4518,4 +4506,101 @@ fn s3_deb_publish_target_rejects_empty_signing_passphrase() {
         error.to_string(),
         "release environment variable XTASK_RELEASE_APT_SIGNING_PASSPHRASE must not be empty"
     );
+}
+
+#[test]
+fn s3_publish_report_serializes_artifacts_like_package_manifests() {
+    let mut report = genmeta_xtask_release::report::S3PublishReport::new(false);
+    report.add_manifest(genmeta_xtask_release::report::S3PublishReportManifest {
+        kind: PackageSystem::Deb,
+        package: "pishoo".to_string(),
+        version: "0.8.0-beta.4".to_string(),
+        generated_at: "2026-06-29T00:00:00Z".to_string(),
+        git_commit: Some("0123456789abcdef".to_string()),
+        git_dirty: false,
+        artifacts: vec![genmeta_xtask_release::report::S3PublishReportArtifact {
+            target: "x86_64-unknown-linux-gnu".to_string(),
+            path: "x86_64-unknown-linux-gnu/release/deb/pishoo_0.8.0~beta.4-1_amd64.deb"
+                .to_string(),
+            local_path:
+                "target/x86_64-unknown-linux-gnu/release/deb/pishoo_0.8.0~beta.4-1_amd64.deb"
+                    .to_string(),
+            sha256: "abc123".to_string(),
+            size: 12345,
+            package_name: Some("pishoo".to_string()),
+            package_version: Some("0.8.0~beta.4-1".to_string()),
+            architecture: Some("amd64".to_string()),
+            archive_name: None,
+            key: "ppa/genmeta/pool/main/p/pishoo/pishoo_0.8.0~beta.4-1_amd64.deb".to_string(),
+        }],
+    });
+
+    let toml = report
+        .to_toml_string()
+        .expect("publish report should serialize as TOML");
+
+    let value: toml::Value = toml::from_str(&toml).expect("report should be TOML");
+    assert_eq!(value["schema-version"].as_integer(), Some(1));
+    assert_eq!(value["dry-run"].as_bool(), Some(false));
+    assert!(value.get("manifests").is_some());
+    assert!(toml.contains("[[manifests]]"));
+    assert!(toml.contains("[[manifests.artifacts]]"));
+    assert!(toml.contains("kind = \"deb\""));
+    assert!(toml.contains("package = \"pishoo\""));
+    assert!(toml.contains("version = \"0.8.0-beta.4\""));
+    assert!(toml.contains("target = \"x86_64-unknown-linux-gnu\""));
+    assert!(toml.contains(
+        "path = \"x86_64-unknown-linux-gnu/release/deb/pishoo_0.8.0~beta.4-1_amd64.deb\""
+    ));
+    assert!(toml.contains(
+        "local-path = \"target/x86_64-unknown-linux-gnu/release/deb/pishoo_0.8.0~beta.4-1_amd64.deb\""
+    ));
+    assert!(toml.contains("package-name = \"pishoo\""));
+    assert!(toml.contains("package-version = \"0.8.0~beta.4-1\""));
+    assert!(!toml.contains("release_asset"));
+    assert!(!toml.contains("dry_run"));
+    assert!(!toml.trim_start().starts_with('{'));
+}
+
+#[test]
+fn s3_publish_report_serializes_archive_artifacts_with_manifest_path_and_local_path() {
+    let mut report = genmeta_xtask_release::report::S3PublishReport::new(false);
+    report.add_manifest(genmeta_xtask_release::report::S3PublishReportManifest {
+        kind: PackageSystem::Brew,
+        package: "gmutils".to_string(),
+        version: "0.8.0-beta.4".to_string(),
+        generated_at: "2026-06-29T00:00:00Z".to_string(),
+        git_commit: None,
+        git_dirty: false,
+        artifacts: vec![genmeta_xtask_release::report::S3PublishReportArtifact {
+            target: "aarch64-apple-darwin".to_string(),
+            path: "aarch64-apple-darwin/release/brew/gmutils-aarch64-apple-darwin.tar.gz"
+                .to_string(),
+            local_path:
+                "target/aarch64-apple-darwin/release/brew/gmutils-aarch64-apple-darwin.tar.gz"
+                    .to_string(),
+            sha256: "def456".to_string(),
+            size: 67890,
+            package_name: None,
+            package_version: None,
+            architecture: None,
+            archive_name: Some("gmutils-aarch64-apple-darwin.tar.gz".to_string()),
+            key: "homebrew/preview/gmutils-aarch64-apple-darwin.tar.gz".to_string(),
+        }],
+    });
+
+    let toml = report
+        .to_toml_string()
+        .expect("publish report should serialize archive TOML");
+
+    assert!(toml.contains("kind = \"brew\""));
+    assert!(toml.contains("archive-name = \"gmutils-aarch64-apple-darwin.tar.gz\""));
+    assert!(toml.contains(
+        "path = \"aarch64-apple-darwin/release/brew/gmutils-aarch64-apple-darwin.tar.gz\""
+    ));
+    assert!(toml.contains(
+        "local-path = \"target/aarch64-apple-darwin/release/brew/gmutils-aarch64-apple-darwin.tar.gz\""
+    ));
+    assert!(!toml.contains("package-name"));
+    assert!(!toml.contains("architecture"));
 }
