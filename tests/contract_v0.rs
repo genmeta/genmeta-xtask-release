@@ -4111,6 +4111,17 @@ fn scoop_template_variables_expose_manifest_and_branch_values() {
 }"
         )
     );
+    let checkver: serde_json::Value = serde_json::from_str(
+        variables
+            .get("scoop.checkver.json")
+            .expect("checkver template variable should exist"),
+    )
+    .expect("checkver template variable should be valid json");
+    assert_eq!(
+        checkver["url"],
+        "https://download.example/scoop/sample-tool.json"
+    );
+    assert_eq!(checkver["re"], r#""version"\s*:\s*"([^"]+)""#);
 }
 
 #[test]

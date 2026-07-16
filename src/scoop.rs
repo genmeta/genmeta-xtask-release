@@ -93,6 +93,8 @@ pub fn scoop_template_variables(
         render_scoop_json_error::WrongKindSnafu
     );
 
+    let names = mutable_entry_names(package_id, PackageSystem::Scoop, &metadata.source_version)
+        .context(render_scoop_json_error::MutableEntryNamesSnafu)?;
     let layout = scoop_layout(manifest, public_base_url)?;
     let mut variables = package_template_variables(package_id, metadata);
     variables.extend(build_feature_variables(manifest));
@@ -129,6 +131,14 @@ pub fn scoop_template_variables(
         "scoop.autoupdate.json".to_string(),
         serde_json::to_string_pretty(&layout.autoupdate)
             .context(render_scoop_json_error::SerializeSnafu)?,
+    );
+    variables.insert(
+        "scoop.checkver.json".to_string(),
+        serde_json::to_string_pretty(&CheckVer {
+            url: public_base_url.join(&names.latest),
+            re: r#""version"\s*:\s*"([^"]+)""#.to_string(),
+        })
+        .context(render_scoop_json_error::SerializeSnafu)?,
     );
     Ok(variables)
 }
