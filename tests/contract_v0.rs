@@ -78,6 +78,17 @@ fn dhttp_build_values(root_ca: &str) -> std::collections::BTreeMap<String, Strin
 }
 
 fn contract_with_deb_requirement(bound: &str) -> String {
+    let bounds = format!(r#"">=" = {bound}"#);
+    contract_with_deb_version_bounds(
+        &bounds,
+        r#"version = "1.4.0"
+description = "Sample common files"
+license = "Apache-2.0"
+homepage = "https://dhttp.net""#,
+    )
+}
+
+fn contract_with_deb_version_bounds(bounds: &str, dependency: &str) -> String {
     format!(
         r#"
 [package.sample-tool]
@@ -92,13 +103,10 @@ architecture = "target"
 dockerfile = "xtask/release/deb/Dockerfile"
 
 [package.sample-tool.deb.requires.sample-common.version]
-">=" = {bound}
+{bounds}
 
 [package.sample-common]
-version = "1.4.0"
-description = "Sample common files"
-license = "Apache-2.0"
-homepage = "https://dhttp.net"
+{dependency}
 
 [package.sample-common.deb]
 revision = "2"
@@ -503,6 +511,30 @@ fn version_bound_literal_resolves_unchanged() {
         .get("sample-common")
         .expect("common bound should exist");
     assert_eq!(common.minimum.as_deref(), Some("0.5.1-1"));
+}
+
+#[test]
+fn version_bounds_without_dependency_source_skip_dependency_metadata() {
+    let input = contract_with_deb_version_bounds(
+        r#"">=" = { value = "0.5.1-1" }
+"<=" = { from = "self" }"#,
+        r#"manifest = "missing/Cargo.toml""#,
+    );
+    let contract = parse_contract(&input).expect("literal and self bounds should validate");
+
+    let bounds = genmeta_xtask_release::requires::resolve_requires_for(
+        &contract,
+        Path::new("."),
+        "sample-tool",
+        PackageSystem::Deb,
+    )
+    .expect("unused dependency metadata should not resolve");
+
+    let common = bounds
+        .get("sample-common")
+        .expect("common bounds should exist");
+    assert_eq!(common.minimum.as_deref(), Some("0.5.1-1"));
+    assert_eq!(common.maximum.as_deref(), Some("2.0.0-1"));
 }
 
 #[test]

@@ -86,40 +86,45 @@ pub fn resolve_requires_for(
 
     let mut resolved = BTreeMap::new();
     for (dependency_id, required) in branch.requires().iter() {
-        let dependency_version =
-            dependency_package_version(contract, contract_root, dependency_id.as_str(), system)?;
+        let mut dependency_version: Option<PackageVersion> = None;
+        let mut resolve_bound = |bound: &VersionBoundSourceContract| match bound {
+            VersionBoundSourceContract::Source(VersionBoundSource::SelfPackage) => {
+                Ok(self_version.as_string())
+            }
+            VersionBoundSourceContract::Source(VersionBoundSource::DependencyPackage) => {
+                if let Some(version) = &dependency_version {
+                    return Ok(version.as_string());
+                }
+                let version = dependency_package_version(
+                    contract,
+                    contract_root,
+                    dependency_id.as_str(),
+                    system,
+                )?;
+                let resolved = version.as_string();
+                dependency_version = Some(version);
+                Ok(resolved)
+            }
+            VersionBoundSourceContract::Literal(value) => Ok(value.clone()),
+        };
         let minimum = required
             .version
             .minimum
             .as_ref()
-            .map(|bound| resolve_version_bound(bound, &self_version, &dependency_version));
+            .map(&mut resolve_bound)
+            .transpose()?;
         let maximum = required
             .version
             .maximum
             .as_ref()
-            .map(|bound| resolve_version_bound(bound, &self_version, &dependency_version));
+            .map(&mut resolve_bound)
+            .transpose()?;
         resolved.insert(
             dependency_id.as_str().to_owned(),
             ResolvedVersionBounds { minimum, maximum },
         );
     }
     Ok(resolved)
-}
-
-fn resolve_version_bound(
-    bound: &VersionBoundSourceContract,
-    self_version: &PackageVersion,
-    dependency_version: &PackageVersion,
-) -> String {
-    match bound {
-        VersionBoundSourceContract::Source(VersionBoundSource::SelfPackage) => {
-            self_version.as_string()
-        }
-        VersionBoundSourceContract::Source(VersionBoundSource::DependencyPackage) => {
-            dependency_version.as_string()
-        }
-        VersionBoundSourceContract::Literal(value) => value.clone(),
-    }
 }
 
 fn dependency_package_version(
