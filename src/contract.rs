@@ -487,10 +487,31 @@ pub struct VersionBoundContract {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "VersionBoundSourceInput")]
+pub enum VersionBoundSourceContract {
+    Source(VersionBoundSource),
+    Literal(String),
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
-pub struct VersionBoundSourceContract {
-    pub from: VersionBoundSource,
+struct VersionBoundSourceInput {
+    from: Option<VersionBoundSource>,
+    value: Option<String>,
+}
+
+impl TryFrom<VersionBoundSourceInput> for VersionBoundSourceContract {
+    type Error = &'static str;
+
+    fn try_from(input: VersionBoundSourceInput) -> Result<Self, Self::Error> {
+        match (input.from, input.value) {
+            (Some(source), None) => Ok(Self::Source(source)),
+            (None, Some(value)) if !value.is_empty() => Ok(Self::Literal(value)),
+            (None, Some(_)) => Err("version bound literal value must not be empty"),
+            _ => Err("version bound must set exactly one of from or value"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

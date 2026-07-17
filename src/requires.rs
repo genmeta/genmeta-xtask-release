@@ -4,7 +4,7 @@ use semver::Version;
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    contract::{PackageBranchRef, ReleaseContract, VersionBoundSource},
+    contract::{PackageBranchRef, ReleaseContract, VersionBoundSource, VersionBoundSourceContract},
     package::{PackageVersion, resolve_metadata},
     system::PackageSystem,
 };
@@ -92,24 +92,34 @@ pub fn resolve_requires_for(
             .version
             .minimum
             .as_ref()
-            .map(|bound| match bound.from {
-                VersionBoundSource::SelfPackage => self_version.as_string(),
-                VersionBoundSource::DependencyPackage => dependency_version.as_string(),
-            });
+            .map(|bound| resolve_version_bound(bound, &self_version, &dependency_version));
         let maximum = required
             .version
             .maximum
             .as_ref()
-            .map(|bound| match bound.from {
-                VersionBoundSource::SelfPackage => self_version.as_string(),
-                VersionBoundSource::DependencyPackage => dependency_version.as_string(),
-            });
+            .map(|bound| resolve_version_bound(bound, &self_version, &dependency_version));
         resolved.insert(
             dependency_id.as_str().to_owned(),
             ResolvedVersionBounds { minimum, maximum },
         );
     }
     Ok(resolved)
+}
+
+fn resolve_version_bound(
+    bound: &VersionBoundSourceContract,
+    self_version: &PackageVersion,
+    dependency_version: &PackageVersion,
+) -> String {
+    match bound {
+        VersionBoundSourceContract::Source(VersionBoundSource::SelfPackage) => {
+            self_version.as_string()
+        }
+        VersionBoundSourceContract::Source(VersionBoundSource::DependencyPackage) => {
+            dependency_version.as_string()
+        }
+        VersionBoundSourceContract::Literal(value) => value.clone(),
+    }
 }
 
 fn dependency_package_version(

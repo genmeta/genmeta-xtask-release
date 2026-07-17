@@ -77,6 +77,43 @@ fn dhttp_build_values(root_ca: &str) -> std::collections::BTreeMap<String, Strin
     ])
 }
 
+fn contract_with_deb_requirement(bound: &str) -> String {
+    format!(
+        r#"
+[package.sample-tool]
+version = "2.0.0"
+description = "Sample tool"
+license = "Apache-2.0"
+homepage = "https://dhttp.net"
+
+[package.sample-tool.deb]
+revision = "1"
+architecture = "target"
+dockerfile = "xtask/release/deb/Dockerfile"
+
+[package.sample-tool.deb.requires.sample-common.version]
+">=" = {bound}
+
+[package.sample-common]
+version = "1.4.0"
+description = "Sample common files"
+license = "Apache-2.0"
+homepage = "https://dhttp.net"
+
+[package.sample-common.deb]
+revision = "2"
+architecture = "all"
+dockerfile = "xtask/release/deb/Dockerfile"
+
+[destination.s3]
+bucket = "download"
+endpoint.env = "XTASK_RELEASE_S3_ENDPOINT_URL"
+access_key_id.env = "XTASK_RELEASE_S3_ACCESS_KEY_ID"
+secret_access_key.env = "XTASK_RELEASE_S3_SECRET_ACCESS_KEY"
+"#
+    )
+}
+
 #[test]
 fn canonical_gmutils_uses_final_package_executor_schema() {
     let contract = load_fixture("gmutils.release.toml");
@@ -447,6 +484,77 @@ homepage = "https://dhttp.net"
     let common = bounds.get("pishoo-common").expect("common bound exists");
     assert_eq!(common.minimum.as_deref(), Some("0.5.1-1"));
     assert_eq!(common.maximum.as_deref(), Some("0.7.0-1"));
+}
+
+#[test]
+fn version_bound_literal_resolves_unchanged() {
+    let input = contract_with_deb_requirement(r#"{ value = "0.5.1-1" }"#);
+    let contract = parse_contract(&input).expect("literal bound contract should validate");
+
+    let bounds = genmeta_xtask_release::requires::resolve_requires_for(
+        &contract,
+        Path::new("."),
+        "sample-tool",
+        PackageSystem::Deb,
+    )
+    .expect("literal bound should resolve");
+
+    let common = bounds
+        .get("sample-common")
+        .expect("common bound should exist");
+    assert_eq!(common.minimum.as_deref(), Some("0.5.1-1"));
+}
+
+#[test]
+fn version_bound_empty_literal_is_rejected() {
+    let input = contract_with_deb_requirement(r#"{ value = "" }"#);
+
+    let error = toml::from_str::<ReleaseContract>(&input)
+        .expect_err("empty literal bound should fail parsing");
+
+    assert!(
+        error
+            .to_string()
+            .contains("version bound literal value must not be empty")
+    );
+}
+
+#[test]
+fn version_bound_mixed_source_and_literal_is_rejected() {
+    let input = contract_with_deb_requirement(r#"{ from = "dependency", value = "0.5.1-1" }"#);
+
+    let error = toml::from_str::<ReleaseContract>(&input)
+        .expect_err("mixed source and literal bound should fail parsing");
+
+    assert!(
+        error
+            .to_string()
+            .contains("version bound must set exactly one of from or value")
+    );
+}
+
+#[test]
+fn version_bound_missing_source_and_literal_is_rejected() {
+    let input = contract_with_deb_requirement("{}");
+
+    let error = toml::from_str::<ReleaseContract>(&input)
+        .expect_err("bound without source or literal should fail parsing");
+
+    assert!(
+        error
+            .to_string()
+            .contains("version bound must set exactly one of from or value")
+    );
+}
+
+#[test]
+fn version_bound_unknown_field_is_rejected() {
+    let input = contract_with_deb_requirement(r#"{ from = "dependency", unexpected = true }"#);
+
+    let error = toml::from_str::<ReleaseContract>(&input)
+        .expect_err("unknown version bound field should fail parsing");
+
+    assert!(error.to_string().contains("unknown field `unexpected`"));
 }
 
 #[test]
