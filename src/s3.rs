@@ -916,32 +916,43 @@ fn deb_metadata_script(suite: &str, fingerprint: &str, has_passphrase: bool) -> 
         }
     }
     script.push_str(&format!(
-        "mkdir -p dists/{suite}\n\
-         apt-ftparchive \
-           -o {} \
-           -o {} \
-           -o {} \
-           -o {} \
-           -o {} \
-           -o {} \
-           -o {} \
-           -o {} \
-           release {} > {}\n",
+        "apt-ftparchive -o {} -o {} -o {} -o {} -o {} -o {} -o {} -o {} -o {} release {} > Release.new\n\
+         mv Release.new {}\n",
         shell_quote("APT::FTPArchive::Release::Origin=genmeta"),
         shell_quote("APT::FTPArchive::Release::Label=genmeta"),
         shell_quote("APT::FTPArchive::Release::Suite=stable"),
         shell_quote(&format!("APT::FTPArchive::Release::Codename={suite}")),
         shell_quote("APT::FTPArchive::Release::Version=2025"),
-        shell_quote(&format!(
-            "APT::FTPArchive::Release::Architectures={architectures}"
-        )),
-        shell_quote(&format!(
-            "APT::FTPArchive::Release::Components={components}"
-        )),
+        shell_quote(&format!("APT::FTPArchive::Release::Architectures={architectures}")),
+        shell_quote(&format!("APT::FTPArchive::Release::Components={components}")),
         shell_quote("APT::FTPArchive::Release::Description=Genmeta Package Archives"),
+        shell_quote("APT::FTPArchive::Release::Acquire-By-Hash=yes"),
         shell_quote(&format!("dists/{suite}")),
         shell_quote(&format!("dists/{suite}/Release")),
     ));
+    // Copy indexes after creating Release so by-hash paths are not themselves
+    // included in its checksum table. Existing remote hashes are never deleted.
+    for component in APT_COMPONENTS {
+        for arch in APT_ARCHES {
+            let base = format!("dists/{suite}/{component}/binary-{arch}");
+            script.push_str(&format!(
+                "for index in {base}/Packages {base}/Packages.gz {base}/Release; do\n"
+            ));
+            for (algorithm, command) in [
+                ("MD5Sum", "md5sum"),
+                ("SHA1", "sha1sum"),
+                ("SHA256", "sha256sum"),
+                ("SHA512", "sha512sum"),
+            ] {
+                script.push_str(&format!(
+                    "digest=$({command} \"$index\" | cut -d ' ' -f 1)\n\
+                     mkdir -p {base}/by-hash/{algorithm}\n\
+                     cp \"$index\" \"{base}/by-hash/{algorithm}/$digest\"\n"
+                ));
+            }
+            script.push_str("done\n");
+        }
+    }
     let fingerprint = normalize_fingerprint(fingerprint);
     let passphrase = if has_passphrase {
         " --passphrase-file /apt-secrets/passphrase"
@@ -1219,7 +1230,7 @@ fn repository_uploads(
         uploads.push(PlannedUpload {
             path: entry.path().to_path_buf(),
             key: prefix.join(&relative),
-            entry: !relative.ends_with(extension),
+            entry: !relative.ends_with(extension) && !relative.contains("/by-hash/"),
             condition: None,
         });
     }
@@ -1275,11 +1286,9 @@ fn publish_uploads(
     bucket: &str,
     mut uploads: Vec<PlannedUpload>,
 ) -> Result<(), S3PublishError> {
-    uploads.sort_by(|left, right| {
-        publish_upload_order(left.entry)
-            .cmp(&publish_upload_order(right.entry))
-            .then_with(|| left.key.cmp(&right.key))
-    });
+    // Keep each repository's metadata commit order: a lexical re-sort would
+    // move InRelease/repomd.xml ahead of the indexes they authenticate.
+    uploads.sort_by_key(|upload| publish_upload_order(upload.entry));
     if options.dry_run {
         for upload in uploads {
             eprintln!("would upload {} from {}", upload.key, upload.path.display());
@@ -1290,6 +1299,21 @@ fn publish_uploads(
         upload_file(client, bucket, &upload.path, &upload.key, upload.condition)?;
     }
     Ok(())
+}
+
+// Package archives and content-addressed indexes are immutable. All other
+// objects include mutable repository entries and versionless package pointers.
+fn upload_cache_control(key: &str) -> &'static str {
+    if key.contains("/by-hash/")
+        || key.ends_with(".deb")
+        || key.ends_with(".rpm")
+        || key.ends_with(".tar.gz")
+        || key.ends_with(".zip")
+    {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache, max-age=0, must-revalidate"
+    }
 }
 
 fn upload_file(
@@ -1309,6 +1333,7 @@ fn upload_file(
         .put_object()
         .bucket(bucket)
         .key(key)
+        .cache_control(upload_cache_control(key))
         .body(body);
     match condition {
         Some(UploadCondition::IfMissing) => {
@@ -1595,7 +1620,241 @@ fn normalize_fingerprint(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_missing_object;
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn uploads_preserve_commit_order_conditions_and_cache_headers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let keys = [
+            ("ppa/genmeta/pool/main/t/test/test_1_arm64.deb", false),
+            (
+                "ppa/genmeta/dists/preview/main/binary-arm64/by-hash/SHA256/abc",
+                false,
+            ),
+            (
+                "ppa/genmeta/dists/preview/main/binary-arm64/Packages.gz",
+                true,
+            ),
+            ("ppa/genmeta/dists/preview/Release", true),
+            ("ppa/genmeta/dists/preview/Release.gpg", true),
+            ("ppa/genmeta/dists/preview/InRelease", true),
+        ];
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut requests = Vec::new();
+            while requests.len() < keys.len() {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "missing S3 requests");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                }
+                let header = String::from_utf8(header).unwrap().to_lowercase();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .map(|value| value.parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(body, b"index");
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nETag: \"new\"\r\n\r\n").unwrap();
+                requests.push(header);
+            }
+            requests
+        });
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(Region::new("auto"))
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .force_path_style(true)
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .build();
+        let client = S3Client {
+            runtime: tokio::runtime::Runtime::new().unwrap(),
+            client: Client::from_conf(config),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index");
+        fs::write(&path, b"index").unwrap();
+        let uploads = keys
+            .iter()
+            .map(|(key, entry)| PlannedUpload {
+                path: path.clone(),
+                key: (*key).to_owned(),
+                entry: *entry,
+                condition: Some(if *entry {
+                    UploadCondition::IfMatch("\"old\"".to_owned())
+                } else {
+                    UploadCondition::IfMissing
+                }),
+            })
+            .collect();
+        publish_uploads(&S3Options { dry_run: false }, &client, "test", uploads).unwrap();
+        for ((key, entry), request) in keys.iter().zip(server.join().unwrap()) {
+            let target = request.split_whitespace().nth(1).unwrap();
+            assert_eq!(
+                target.split('?').next().unwrap(),
+                format!("/test/{}", key.to_lowercase())
+            );
+            if *entry {
+                assert!(
+                    request.contains("cache-control: no-cache, max-age=0, must-revalidate\r\n")
+                );
+                assert!(request.contains("if-match: \"old\"\r\n"));
+            } else {
+                assert!(request.contains("cache-control: public, max-age=31536000, immutable\r\n"));
+                assert!(request.contains("if-none-match: *\r\n"));
+            }
+        }
+    }
+
+    #[test]
+    fn by_hash_files_are_immutable_repository_uploads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("dists/preview/main/binary-arm64/by-hash/SHA256");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("abc"), b"index").unwrap();
+        let prefix = crate::publish::RemotePrefix::parse("ppa/genmeta").unwrap();
+        let uploads = repository_uploads(directory.path(), &prefix, PackageSystem::Deb).unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert!(!uploads[0].entry);
+    }
+
+    #[test]
+    #[ignore = "requires Docker, network access and gpg; run explicitly in CI"]
+    fn signed_apt_repository_has_nonrecursive_by_hash_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("gpg");
+        fs::create_dir(&home).unwrap();
+        let output = Command::new("gpg")
+            .args([
+                "--homedir",
+                home.to_str().unwrap(),
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                "Release Test <test@example.invalid>",
+                "ed25519",
+                "sign",
+                "0",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new("gpg")
+            .args([
+                "--homedir",
+                home.to_str().unwrap(),
+                "--batch",
+                "--with-colons",
+                "--list-keys",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let fingerprint = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("fpr:")
+                    .map(|_| line.split(':').nth(9).unwrap().to_owned())
+            })
+            .unwrap();
+        let output = Command::new("gpg")
+            .args([
+                "--homedir",
+                home.to_str().unwrap(),
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--armor",
+                "--export-secret-keys",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let secrets = directory.path().join("secrets");
+        fs::create_dir(&secrets).unwrap();
+        fs::write(secrets.join("key.asc"), output.stdout).unwrap();
+        let repository = directory.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        let script = deb_metadata_script("preview", &fingerprint, false);
+        fs::write(directory.path().join("metadata.sh"), script).unwrap();
+        let output = Command::new("docker").args([
+            "run", "--rm", "--volume",
+            &format!("{}:/test", directory.path().display()),
+            "--volume", &format!("{}:/apt-repository", repository.display()),
+            "--volume", &format!("{}:/apt-secrets:ro", secrets.display()),
+            "debian:bookworm", "/bin/sh", "-ec",
+            r#"apt-get update -qq
+apt-get install -y -qq dpkg-dev
+mkdir -p /fixture/DEBIAN /apt-repository/pool/main/t/test
+printf 'Package: test\nVersion: 1\nArchitecture: all\nMaintainer: Test <test@example.invalid>\nDescription: test\n' > /fixture/DEBIAN/control
+dpkg-deb --build /fixture /apt-repository/pool/main/t/test/test_1_all.deb
+sh /test/metadata.sh
+cd /apt-repository/dists/preview
+grep -qx 'Acquire-By-Hash: yes' Release
+! grep -E '^ +[a-f0-9]+ +[0-9]+ +(Release|.*by-hash/.*)$' Release
+for index in */binary-*/*; do
+  [ -f "$index" ] || continue
+  for pair in 'MD5Sum md5sum' 'SHA1 sha1sum' 'SHA256 sha256sum' 'SHA512 sha512sum'; do
+    set -- $pair
+    digest=$($2 "$index" | cut -d ' ' -f 1)
+    cmp "$index" "$(dirname "$index")/by-hash/$1/$digest"
+  done
+done
+gpg --homedir /tmp/xtask-apt-gpg --verify Release.gpg Release
+gpg --homedir /tmp/xtask-apt-gpg --output verified --decrypt InRelease
+cmp Release verified
+# A real APT client must be able to consume the signed by-hash repository.
+gpg --homedir /tmp/xtask-apt-gpg --export > /test/trusted.gpg
+printf 'deb [signed-by=/test/trusted.gpg] file:/apt-repository preview main\n' > /test/sources.list
+mkdir -p /test/lists/partial
+apt-get -o Dir::Etc::sourcelist=/test/sources.list -o Dir::Etc::sourceparts=- -o Dir::State::lists=/test/lists update
+apt-cache -o Dir::Etc::sourcelist=/test/sources.list -o Dir::Etc::sourceparts=- -o Dir::State::lists=/test/lists show test | grep -qx 'Version: 1'
+"#,
+        ]).output().unwrap();
+        Command::new("gpgconf")
+            .args(["--homedir", home.to_str().unwrap(), "--kill", "all"])
+            .status()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn not_found_without_message_is_missing_object() {

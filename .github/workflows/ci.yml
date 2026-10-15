@@ -41,6 +41,12 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Test public URL verification
+        run: python3 -m unittest discover -s scripts -v
+
+      - name: Test signed APT metadata with a real APT client
+        run: cargo test --lib signed_apt_repository_has_nonrecursive_by_hash_indexes -- --ignored --nocapture
+
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
