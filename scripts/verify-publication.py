@@ -19,8 +19,11 @@ def fetch(base, key):
     # No query parameters, request cache directives or cache-busting headers:
     # this must observe the same CDN objects that ordinary APT clients receive.
     url = base.rstrip("/") + "/" + urllib.parse.quote(key, safe="/~")
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "genmeta-xtask-release/0.2"}
+    )
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             data = response.read()
             cache = ", ".join(
                 f"{name}={response.headers[name]}"

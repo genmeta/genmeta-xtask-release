@@ -132,6 +132,7 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.verify(), (1, 3))
         for path, headers in self.requests:
             self.assertNotIn("?", path)
+            self.assertEqual(headers["User-Agent"], "genmeta-xtask-release/0.2")
             self.assertNotIn("Cache-Control", headers)
             self.assertNotIn("Pragma", headers)
 
