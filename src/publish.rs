@@ -441,7 +441,7 @@ pub fn linux_repository_upload_order(
 }
 
 fn deb_repository_upload_order(key: &str) -> u8 {
-    if key.contains("/pool/") || key.starts_with("pool/") {
+    if key.contains("/pool/") || key.starts_with("pool/") || key.contains("/by-hash/") {
         return 0;
     }
     if key.contains("/binary-") {
